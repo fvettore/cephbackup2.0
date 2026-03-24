@@ -115,10 +115,9 @@ lastbk.txt           ← timestamp of last completed backup
 6. Add to cron:
    ```
    0 2 * * *  /path/bkexec.py
-   0 3 * * *  /path/bkretention.py
    0 4 * * *  /path/bktrimsnap.py
    ```
-7. On the target: copy `TARGETSIDE/` and cron `bklock.py`
+7. On the target: copy `TARGETSIDE/` and cron `bklock.py` and `bkretention.py`
 
 ## Listing restore points
 
