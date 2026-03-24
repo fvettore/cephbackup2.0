@@ -1,4 +1,4 @@
-# cephbackup
+# cephbackup2.0
 
 A simple suite to perform full/incremental backups of KVM virtual machine disk images on CEPH storage, with restore and retention management. Designed for KVM clusters with CEPH storage.
 
