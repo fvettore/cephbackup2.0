@@ -4,3 +4,5 @@ __pycache__
 config.ini
 TARGETSIDE/config.ini
 CLAUDE.md
+backupjobs.json
+backupjobs.json.bk
