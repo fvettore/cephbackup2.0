@@ -57,7 +57,10 @@ def load_config() -> dict:
 
 
 def load_jobs() -> list:
-    with open(SCRIPT_DIR / "backupjobs.json") as f:
+    p = SCRIPT_DIR / "backupjobs.json"
+    if not p.exists():
+        p.write_text("[]")
+    with open(p) as f:
         return json.load(f)
 
 
@@ -1297,6 +1300,7 @@ def screen_backup_list(stdscr, config: dict, jobs: list):
                 f"{job['name']:<{col_name}}  {en:<{col_en}}  "
                 f"{run:<{col_run}}  {comp:<{col_compl}}  {job.get('path','')}"
             )
+        labels.append("  [+ Add new job]")
 
         idx = scrollable_list(
             stdscr,
@@ -1307,7 +1311,28 @@ def screen_backup_list(stdscr, config: dict, jobs: list):
         )
         if idx is None:
             return
-        screen_job_edit(stdscr, config, jobs, idx)
+        if idx == len(jobs):
+            name = edit_text_dialog(stdscr, "New job name", "")
+            if not name:
+                continue
+            new_job = {
+                "name":        name,
+                "enabled":     0,
+                "path":        "",
+                "mountpoint":  "",
+                "checkmount":  1,
+                "max_inc":     5,
+                "snap-prefix": "BK",
+                "max-snaps":   10,
+                "email_from":  "",
+                "rcpt_to":     [],
+                "schedule":    {"days": [], "weeks": []},
+            }
+            jobs.append(new_job)
+            save_jobs(jobs)
+            screen_job_edit(stdscr, config, jobs, len(jobs) - 1)
+        else:
+            screen_job_edit(stdscr, config, jobs, idx)
 
 
 def screen_main_menu(stdscr, config, jobs):
