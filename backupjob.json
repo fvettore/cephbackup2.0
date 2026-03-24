@@ -1,0 +1,138 @@
+[
+  {
+    "name": "NAS11day01",
+    "max_inc": 5,
+    "enabled": 1,
+    "lastrun": "2026-03-23 21:30:01",
+    "lastcompletion": "2026-03-23 22:07:24",
+    "path": "/nfs/backup/CEPH",
+    "checkmount": 1,
+    "mountpoint": "/nfs/backup",
+    "snap-prefix": "BK01",
+    "max-snaps": 5,
+    "email_from": "ced@mydomain.com",
+    "rcpt_to": [
+      "ced@mydomain.com"
+    ],
+    "schedule": {
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "weeks": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    }
+  },
+  {
+    "name": "NAS06_day",
+    "max_inc": 8,
+    "enabled": 1,
+    "lastrun": "2026-03-23 22:07:24",
+    "lastcompletion": "2026-03-23 22:36:28",
+    "path": "/nfs/backup01",
+    "checkmount": 1,
+    "mountpoint": "/nfs/backup01",
+    "snap-prefix": "BK02",
+    "max-snaps": 5,
+    "email_from": "ced@omain.com",
+    "rcpt_to": [
+      "ced@mydomain.com"
+    ],
+    "schedule": {
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "weeks": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    }
+  },
+  {
+    "name": "NAS12day",
+    "max_inc": 5,
+    "enabled": 1,
+    "lastrun": "2026-03-23 22:36:29",
+    "lastcompletion": "2026-03-23 22:44:28",
+    "path": "/nfs/backup02",
+    "checkmount": 1,
+    "mountpoint": "/nfs/backup02",
+    "snap-prefix": "BK03",
+    "max-snaps": 5,
+    "email_from": "ced@maydomain.com",
+    "rcpt_to": [
+      "ced@maydomain.com"
+    ],
+    "schedule": {
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "weeks": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    }
+  },
+  {
+    "name": "NAS12test",
+    "max_inc": 5,
+    "enabled": 0,
+    "lastrun": "2026-03-24 10:33:11",
+    "lastcompletion": "2026-03-24 10:33:22",
+    "path": "/nfs/backup02",
+    "checkmount": 1,
+    "mountpoint": "/nfs/backup02",
+    "snap-prefix": "BK05",
+    "max-snaps": 5,
+    "email_from": "ced@mydomain.com",
+    "rcpt_to": [
+      "ced@mydomain.com"
+    ],
+    "schedule": {
+      "days": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "weeks": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ]
+    }
+  }
+]
