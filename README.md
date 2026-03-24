@@ -4,11 +4,12 @@ A simple suite to perform full/incremental backups of KVM virtual machine disk i
 
 Backup is **crash-consistent**. For application-consistent backups, additional steps (e.g. freezing the VM or saving VRAM) are required before the snapshot.
 
-2.0 version have full UI
+2.0 version have fully functional UI
 
 
 ![Immagine 2026-03-24 141028](https://github.com/user-attachments/assets/597ed3c6-cfdb-40a6-9f78-f5746f4bc97f)
 
+Every scheduled action proiduces a detailed email reporting relevant data:
 
 ![Immagine 2025-02-12 155202](https://github.com/user-attachments/assets/f34f4fdb-d8e8-4274-aa51-0538478085a2)
 
