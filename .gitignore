@@ -1,0 +1,6 @@
+.claude/
+tmp/
+__pycache__
+config.ini
+TARGETSIDE/config.ini
+CLAUDE.md
