@@ -83,6 +83,7 @@ rcpt_to    = admin@example.com
 2. For each job it checks the schedule (days/weeks) — skips if today is not scheduled
 3. Checks the lock (`lastrun > lastcompletion`) — if active, notifies by email and exits
 4. For each VM directory and each disk image:
+   - If `vmbackup.json` contains `"enabled": 0` → **VM is skipped**
    - If never backed up → performs a **FULL** backup
    - Otherwise → performs an **INCREMENTAL** backup until `max_inc` is reached
    - When `max_inc` is reached → rotation: new directory with a new FULL
@@ -146,7 +147,13 @@ lastbk.txt           ← timestamp of last completed backup
 ./cephbackup_ui.py
 ```
 
-The UI guides through VM selection → restore point → image selection → confirmation → live log. The restored VM is defined via `virsh define` and started with networking disabled. To re-enable:
+The UI provides two sections from the main menu:
+
+**Backup management** — select a job to access:
+- *Edit*: configure job parameters (path, schedule, email, etc.)
+- *VM management*: list VMs with enabled/disabled status; press `Enter`/`Space` to toggle backup on/off for a VM; `a` or `[+ Add VM]` to register a new VM (creates the directory and `vmbackup.json`)
+
+**Restore** — guides through VM selection → restore point → image selection → confirmation → live log. The restored VM is defined via `virsh define` and started with the network interface present but link-down. To re-enable:
 ```bash
 virsh domif-setlink <vm>_rest-YYYYMMDD <iface> up
 ```
