@@ -1213,7 +1213,7 @@ def screen_add_vm(stdscr, config: dict, job: dict):
         try:
             vm_dir.mkdir(parents=True, exist_ok=True)
             (vm_dir / "vmbackup.json").write_text(
-                json.dumps({"lastrun": None, "success": None}, indent=2)
+                json.dumps({"lastrun": None, "success": None, "enabled": 1}, indent=2)
             )
             show_message(stdscr, "VM added",
                          [f"'{vm_name}' added to job '{job['name']}'.",
@@ -1228,18 +1228,35 @@ def screen_add_vm(stdscr, config: dict, job: dict):
 def screen_vm_list_for_job(stdscr, config: dict, job: dict):
     col_name = 24
     col_run  = 20
-    header   = f"{'VM':<{col_name}}  {'LAST BACKUP':<{col_run}}  STATUS"
+    col_stat =  6
+    header   = (f"{'VM':<{col_name}}  {'LAST BACKUP':<{col_run}}  "
+                f"{'STATUS':<{col_stat}}  BACKUP")
+
+    cur_idx = 0
+    top_idx = 0
 
     while True:
-        vms    = get_vms_in_job(job)
-        labels = []
+        vms   = get_vms_in_job(job)
+        items = []
         for vm_name in vms:
             vm_dir = Path(job["path"]) / job["name"] / vm_name
             vmb    = load_vmbackup(vm_dir)
             run    = vmb.get("lastrun") or "never"
             ok     = vmb.get("success")
             stato  = "-" if ok is None else ("OK" if ok else "FAIL")
-            labels.append(f"{vm_name:<{col_name}}  {run:<{col_run}}  {stato}")
+            en     = vmb.get("enabled", 1)
+            items.append({
+                'name':    vm_name,
+                'label':   (f"{vm_name:<{col_name}}  {run:<{col_run}}  "
+                            f"{stato:<{col_stat}}  {'ON' if en else 'OFF'}"),
+                'enabled': en,
+                'vmb':     vmb,
+                'vm_dir':  vm_dir,
+            })
+        items.append({'name': None, 'label': '  [+ Add VM]',
+                      'enabled': None, 'vmb': None, 'vm_dir': None})
+
+        cur_idx = min(cur_idx, len(items) - 1)
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
@@ -1258,20 +1275,30 @@ def screen_vm_list_for_job(stdscr, config: dict, job: dict):
         list_start = 3
         list_rows  = h - 5
 
-        if not labels:
-            try:
-                stdscr.addstr(list_start, 2, "(no VMs present)",
-                              curses.color_pair(C_DIM))
-            except curses.error:
-                pass
-        else:
-            for i, label in enumerate(labels[:list_rows]):
+        for i, item in enumerate(items[top_idx:top_idx + list_rows]):
+            abs_i = top_idx + i
+            y     = list_start + i
+            label = item['label'][:w - 5]
+            if item['enabled'] is None:
+                color = C_HEADER
+            elif item['enabled']:
+                color = C_OK
+            else:
+                color = C_ERR
+            if abs_i == cur_idx:
                 try:
-                    stdscr.addstr(list_start + i, 2, label[:w - 4])
+                    stdscr.addstr(y, 2, f" {label:<{w - 5}}",
+                                  curses.color_pair(C_SELECT) | curses.A_BOLD)
+                except curses.error:
+                    pass
+            else:
+                try:
+                    stdscr.addstr(y, 2, f" {label}",
+                                  curses.color_pair(color))
                 except curses.error:
                     pass
 
-        hint = " a add VM   q back "
+        hint = " ↑↓ navigate   Enter/Space toggle backup   a add VM   q back "
         try:
             stdscr.addstr(h - 1, 0, hint.ljust(w - 1)[:w - 1],
                           curses.color_pair(C_STATUS))
@@ -1281,10 +1308,50 @@ def screen_vm_list_for_job(stdscr, config: dict, job: dict):
         stdscr.refresh()
         key = stdscr.getch()
 
-        if key in (ord('a'), ord('A')):
+        if key in (curses.KEY_UP, ord('k')):
+            if cur_idx > 0:
+                cur_idx -= 1
+                if cur_idx < top_idx:
+                    top_idx = cur_idx
+        elif key in (curses.KEY_DOWN, ord('j')):
+            if cur_idx < len(items) - 1:
+                cur_idx += 1
+                if cur_idx >= top_idx + list_rows:
+                    top_idx += 1
+        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r'), ord(' ')):
+            item = items[cur_idx]
+            if item['name'] is None:
+                screen_add_vm(stdscr, config, job)
+            else:
+                vmb = item['vmb']
+                vmb['enabled'] = 0 if vmb.get('enabled', 1) else 1
+                item['vm_dir'].joinpath("vmbackup.json").write_text(
+                    json.dumps(vmb, indent=2)
+                )
+        elif key in (ord('a'), ord('A')):
             screen_add_vm(stdscr, config, job)
         elif key in (ord('q'), ord('Q'), 27):
             return
+
+
+# ── Schermata: menu job ───────────────────────────────────────────────────────
+
+def screen_job_menu(stdscr, config: dict, jobs: list, job_idx: int):
+    job   = jobs[job_idx]
+    ITEMS = ["  Edit", "  VM management"]
+    while True:
+        idx = scrollable_list(
+            stdscr,
+            title=f"Job: {job['name']}",
+            items=ITEMS,
+            hint="↑↓ navigate   Enter select   q back",
+        )
+        if idx is None:
+            return
+        if idx == 0:
+            screen_job_edit(stdscr, config, jobs, job_idx)
+        elif idx == 1:
+            screen_vm_list_for_job(stdscr, config, job)
 
 
 # ── Schermata: lista backup job ───────────────────────────────────────────────
@@ -1341,7 +1408,7 @@ def screen_backup_list(stdscr, config: dict, jobs: list):
             save_jobs(jobs)
             screen_job_edit(stdscr, config, jobs, len(jobs) - 1)
         else:
-            screen_job_edit(stdscr, config, jobs, idx)
+            screen_job_menu(stdscr, config, jobs, idx)
 
 
 def screen_main_menu(stdscr, config, jobs):
