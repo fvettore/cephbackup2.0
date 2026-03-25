@@ -297,6 +297,11 @@ def main():
             vm_name = vm_dir.name
             lg(f"\n--- VM: {vm_name} ---")
 
+            vmb = load_vmbackup(vm_dir)
+            if vmb.get("enabled", 1) == 0:
+                lg(f"VM {vm_name} disabled in vmbackup.json, skipping")
+                continue
+
             # Immagini disco dalla definizione libvirt
             images, xml_err = get_vm_images(vm_name, vm_cfg_path)
             if xml_err:
