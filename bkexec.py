@@ -109,11 +109,11 @@ def get_vm_images(vm_name, vm_config_path):
 
 def get_backup_state(image_dir):
     """
-    Ricava (vm_full, vm_inc) dalla struttura delle cartelle:
+    Ricava (latest_full_idx, vm_inc) dalla struttura delle cartelle:
       image_dir/000001/000000  ← full
       image_dir/000001/000001  ← primo incrementale
-    vm_full = numero di cartelle di primo livello
-    vm_inc  = numero di voci nella cartella più recente (escluso 000000)
+    latest_full_idx = valore numerico dell'ultima cartella di primo livello
+    vm_inc          = numero di voci nella cartella più recente (escluso 000000)
     """
     if not image_dir.exists():
         return 0, 0
@@ -125,11 +125,11 @@ def get_backup_state(image_dir):
     if not full_dirs:
         return 0, 0
 
-    vm_full   = len(full_dirs)
     latest    = full_dirs[-1]
+    latest_full_idx = int(latest.name)
     inc_items = [d for d in latest.iterdir() if d.name.isdigit() and d.name != "000000"]
     vm_inc    = len(inc_items)
-    return vm_full, vm_inc
+    return latest_full_idx, vm_inc
 
 
 # ──────────────────────────────────────────────────────────── email ──
@@ -321,12 +321,12 @@ def main():
                     lg(f"FIRST backup for VM {vm_name} image {vm_image}")
                     backup_type = "full"
                     vm_inc  = 0
-                    vm_full = 1
+                    vm_full = 1          # prima cartella: 000001
                 elif vm_inc >= max_inc:
                     lg(f"Max INC reached {vm_inc}/{max_inc} for VM {vm_name} — new FULL")
                     backup_type = "full"
                     vm_inc  = 0
-                    vm_full += 1
+                    vm_full += 1         # prossima cartella: indice + 1
                 else:
                     lg(f"INC {vm_inc}/{max_inc} for VM {vm_name}")
                     backup_type = "inc"
