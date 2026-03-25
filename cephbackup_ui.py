@@ -219,7 +219,7 @@ def patch_xml(xml_content, vm_name, date_suffix, restored_images):
     - rename the VM by appending the _rest-DATE suffix
     - remove the UUID
     - replace disk image references with restored names
-    - disable network interfaces
+    - remove network interfaces (prevents any connectivity at startup)
     """
     xml_content = re.sub(
         r'(<name>)' + re.escape(vm_name) + r'(</name>)',
@@ -233,9 +233,10 @@ def patch_xml(xml_content, vm_name, date_suffix, restored_images):
     )
     xml_content = re.sub(r'\s*<uuid>[^<]*</uuid>', '', xml_content)
     xml_content = re.sub(
-        r'(</interface>)',
-        r"  <link state='down'/>\n\1",
+        r'\s*<interface\b[^>]*>.*?</interface>',
+        '',
         xml_content,
+        flags=re.DOTALL,
     )
     for orig, restored in restored_images.items():
         xml_content = xml_content.replace(f'/{orig}', f'/{restored}')
@@ -717,9 +718,9 @@ def screen_restore_run(stdscr, config, vm_name, point, images):
         lv.log(f"VM '{vm_rest_name}' defined successfully.", C_OK)
         lv.log(f"XML:  {result['xml_dest']}", C_DIM)
         if result.get('virsh_start'):
-            lv.log("VM started with network DISABLED.", C_OK)
-            lv.log("Re-enable network with:", C_DIM)
-            lv.log(f"  virsh domif-setlink {vm_rest_name} <iface> up", C_DIM)
+            lv.log("VM started with network interfaces REMOVED.", C_OK)
+            lv.log("To add network back, edit the VM and add interface(s):", C_DIM)
+            lv.log(f"  virsh edit {vm_rest_name}", C_DIM)
         else:
             lv.log(f"WARNING: VM start failed. {result.get('error', '')}", C_ERR)
             lv.log(f"Start manually: virsh start {vm_rest_name}", C_DIM)
