@@ -31,6 +31,7 @@ C_HEADER = 4
 C_DIM    = 5
 C_OK     = 6
 C_ERR    = 7
+C_RUN    = 8
 
 
 def init_colors():
@@ -43,6 +44,7 @@ def init_colors():
     curses.init_pair(C_DIM,    curses.COLOR_WHITE,   -1)
     curses.init_pair(C_OK,     curses.COLOR_GREEN,   -1)
     curses.init_pair(C_ERR,    curses.COLOR_RED,     -1)
+    curses.init_pair(C_RUN,    curses.COLOR_MAGENTA, -1)
 
 
 # ── Config / jobs ─────────────────────────────────────────────────────────────
@@ -1154,6 +1156,13 @@ def load_vmbackup(vm_dir: Path) -> dict:
     return {"lastrun": None, "success": None}
 
 
+def is_job_running(job: dict) -> bool:
+    """True if bkexec.py has started but not yet completed this job."""
+    lastrun  = job.get("lastrun")
+    lastcomp = job.get("lastcompletion")
+    return bool(lastrun and (not lastcomp or lastrun > lastcomp))
+
+
 def get_vms_in_job(job: dict) -> list:
     """VMs already present in the job directory (subdirs, excluding LOGS)."""
     job_dir = Path(job["path"]) / job["name"]
@@ -1236,6 +1245,8 @@ def screen_vm_list_for_job(stdscr, config: dict, job: dict):
     top_idx = 0
 
     while True:
+        job_running     = is_job_running(job)
+        job_lastrun     = job.get("lastrun") or ""
         vms   = get_vms_in_job(job)
         items = []
         for vm_name in vms:
@@ -1243,15 +1254,21 @@ def screen_vm_list_for_job(stdscr, config: dict, job: dict):
             vmb    = load_vmbackup(vm_dir)
             run    = vmb.get("lastrun") or "never"
             ok     = vmb.get("success")
-            stato  = "-" if ok is None else ("OK" if ok else "FAIL")
             en     = vmb.get("enabled", 1)
+            vm_running = (job_running and en
+                          and (not vmb.get("lastrun") or vmb.get("lastrun", "") < job_lastrun))
+            if vm_running:
+                stato = "RUN"
+            else:
+                stato = "-" if ok is None else ("OK" if ok else "FAIL")
             items.append({
-                'name':    vm_name,
-                'label':   (f"{vm_name:<{col_name}}  {run:<{col_run}}  "
-                            f"{stato:<{col_stat}}  {'ON' if en else 'OFF'}"),
-                'enabled': en,
-                'vmb':     vmb,
-                'vm_dir':  vm_dir,
+                'name':       vm_name,
+                'label':      (f"{vm_name:<{col_name}}  {run:<{col_run}}  "
+                               f"{stato:<{col_stat}}  {'ON' if en else 'OFF'}"),
+                'enabled':    en,
+                'running':    vm_running,
+                'vmb':        vmb,
+                'vm_dir':     vm_dir,
             })
         items.append({'name': None, 'label': '  [+ Add VM]',
                       'enabled': None, 'vmb': None, 'vm_dir': None})
@@ -1281,6 +1298,8 @@ def screen_vm_list_for_job(stdscr, config: dict, job: dict):
             label = item['label'][:w - 5]
             if item['enabled'] is None:
                 color = C_HEADER
+            elif item.get('running'):
+                color = C_RUN
             elif item['enabled']:
                 color = C_OK
             else:
@@ -1357,58 +1376,147 @@ def screen_job_menu(stdscr, config: dict, jobs: list, job_idx: int):
 # ── Schermata: lista backup job ───────────────────────────────────────────────
 
 def screen_backup_list(stdscr, config: dict, jobs: list):
+    col_flag  =  7   # "RUNNING" / "       "
+    col_name  = 20
+    col_en    =  3
+    col_run   = 19
+    col_compl = 19
+    header    = (f"{'RUNNING':<{col_flag}}  {'JOB':<{col_name}}  {'EN':<{col_en}}  "
+                 f"{'LAST BACKUP':<{col_run}}  {'COMPLETED':<{col_compl}}  PATH")
+
+    cur_idx = 0
+    top_idx = 0
+
     while True:
         # ricarica ad ogni iterazione per riflettere modifiche appena salvate
-        col_name  = 20
-        col_en    =  3
-        col_run   = 19
-        col_compl = 19
+        jobs = load_jobs()
 
-        header = (f"{'JOB':<{col_name}}  {'EN':<{col_en}}  "
-                  f"{'LAST BACKUP':<{col_run}}  {'COMPLETED':<{col_compl}}  PATH")
-
-        labels = []
+        items = []
         for job in jobs:
-            en   = "YES" if job.get("enabled") else "NO "
-            run  = job.get("lastrun",        "never")
-            comp = job.get("lastcompletion", "never")
-            labels.append(
-                f"{job['name']:<{col_name}}  {en:<{col_en}}  "
-                f"{run:<{col_run}}  {comp:<{col_compl}}  {job.get('path','')}"
-            )
-        labels.append("  [+ Add new job]")
+            en      = "YES" if job.get("enabled") else "NO "
+            run     = job.get("lastrun",        "never")
+            comp    = job.get("lastcompletion", "never")
+            running = is_job_running(job)
+            flag    = "* RUN  " if running else "       "
+            items.append({
+                'job':     job,
+                'label':   (f"{flag}{job['name']:<{col_name}}  {en:<{col_en}}  "
+                            f"{run:<{col_run}}  {comp:<{col_compl}}  {job.get('path','')}"),
+                'running': running,
+            })
+        items.append({'job': None, 'label': '       [+ Add new job]', 'running': False})
 
-        idx = scrollable_list(
-            stdscr,
-            title="Backup — Configured jobs",
-            items=labels,
-            header=header,
-            hint="↑↓ navigate   Enter edit job   q back",
-        )
-        if idx is None:
+        cur_idx = min(cur_idx, len(items) - 1)
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.box()
+
+        t = " Backup — Configured jobs "
+        stdscr.addstr(0, max(2, (w - len(t)) // 2),
+                      t, curses.color_pair(C_TITLE) | curses.A_BOLD)
+        try:
+            stdscr.addstr(1, 2, header[:w - 4],
+                          curses.color_pair(C_HEADER) | curses.A_BOLD)
+            stdscr.hline(2, 1, curses.ACS_HLINE, w - 2)
+        except curses.error:
+            pass
+
+        list_start = 3
+        list_rows  = h - 5
+
+        for i, item in enumerate(items[top_idx:top_idx + list_rows]):
+            abs_i = top_idx + i
+            y     = list_start + i
+            label = item['label'][:w - 5]
+            color = C_RUN if item['running'] else C_DIM
+            if abs_i == cur_idx:
+                try:
+                    stdscr.addstr(y, 2, f" {label:<{w - 5}}",
+                                  curses.color_pair(C_SELECT) | curses.A_BOLD)
+                except curses.error:
+                    pass
+            else:
+                try:
+                    stdscr.addstr(y, 2, f" {label}",
+                                  curses.color_pair(color) |
+                                  (curses.A_BOLD if item['running'] else 0))
+                except curses.error:
+                    pass
+
+        hint = " ↑↓ navigate   Enter edit job   r reset running   q back "
+        try:
+            stdscr.addstr(h - 1, 0, hint.ljust(w - 1)[:w - 1],
+                          curses.color_pair(C_STATUS))
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if key in (curses.KEY_UP, ord('k')):
+            if cur_idx > 0:
+                cur_idx -= 1
+                if cur_idx < top_idx:
+                    top_idx = cur_idx
+        elif key in (curses.KEY_DOWN, ord('j')):
+            if cur_idx < len(items) - 1:
+                cur_idx += 1
+                if cur_idx >= top_idx + list_rows:
+                    top_idx += 1
+        elif key == curses.KEY_PPAGE:
+            cur_idx = max(0, cur_idx - list_rows)
+            top_idx = max(0, top_idx - list_rows)
+        elif key == curses.KEY_NPAGE:
+            cur_idx = min(len(items) - 1, cur_idx + list_rows)
+            top_idx = min(max(0, len(items) - list_rows), top_idx + list_rows)
+        elif key == curses.KEY_HOME:
+            cur_idx = top_idx = 0
+        elif key == curses.KEY_END:
+            cur_idx = len(items) - 1
+            top_idx = max(0, cur_idx - list_rows + 1)
+        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+            item = items[cur_idx]
+            if item['job'] is None:
+                name = edit_text_dialog(stdscr, "New job name", "")
+                if not name:
+                    continue
+                new_job = {
+                    "name":        name,
+                    "enabled":     0,
+                    "path":        "",
+                    "mountpoint":  "",
+                    "checkmount":  1,
+                    "max_inc":     5,
+                    "snap-prefix": "BK",
+                    "max-snaps":   10,
+                    "email_from":  "",
+                    "rcpt_to":     [],
+                    "schedule":    {"days": [], "weeks": []},
+                }
+                jobs.append(new_job)
+                save_jobs(jobs)
+                screen_job_edit(stdscr, config, jobs, len(jobs) - 1)
+            else:
+                # trova l'indice reale nel jobs aggiornato
+                job_idx = next(
+                    (i for i, j in enumerate(jobs) if j['name'] == item['job']['name']),
+                    None
+                )
+                if job_idx is not None:
+                    screen_job_menu(stdscr, config, jobs, job_idx)
+        elif key in (ord('r'), ord('R')):
+            item = items[cur_idx]
+            if item['job'] is not None and item['running']:
+                job = item['job']
+                if confirm_dialog(stdscr, "Reset running state",
+                                  [f"Mark job '{job['name']}' as completed?",
+                                   f"lastcompletion will be set to lastrun:",
+                                   f"  {job.get('lastrun', '')}"]):
+                    job['lastcompletion'] = job['lastrun']
+                    save_jobs(jobs)
+        elif key in (ord('q'), ord('Q'), 27):
             return
-        if idx == len(jobs):
-            name = edit_text_dialog(stdscr, "New job name", "")
-            if not name:
-                continue
-            new_job = {
-                "name":        name,
-                "enabled":     0,
-                "path":        "",
-                "mountpoint":  "",
-                "checkmount":  1,
-                "max_inc":     5,
-                "snap-prefix": "BK",
-                "max-snaps":   10,
-                "email_from":  "",
-                "rcpt_to":     [],
-                "schedule":    {"days": [], "weeks": []},
-            }
-            jobs.append(new_job)
-            save_jobs(jobs)
-            screen_job_edit(stdscr, config, jobs, len(jobs) - 1)
-        else:
-            screen_job_menu(stdscr, config, jobs, idx)
 
 
 def screen_main_menu(stdscr, config, jobs):
