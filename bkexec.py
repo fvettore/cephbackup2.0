@@ -353,11 +353,27 @@ def main():
                     incset  = "000000"
 
                 # Crea snapshot CEPH
-                snap_name = f"{snap_prefix}-{indir}-{incset}"
+                snap_name        = f"{snap_prefix}-{indir}-{incset}"
+                timeout_snap     = job.get("timeout_snap",   120)
+                timeout_export   = job.get("timeout_export", 7200)
                 cmd_snap  = ["rbd", "snap", "create",
                              f"{pool}/{vm_image}", "--snap", snap_name]
                 lg(" ".join(cmd_snap))
-                subprocess.run(cmd_snap, check=False)
+                try:
+                    subprocess.run(cmd_snap, check=False, timeout=timeout_snap)
+                except subprocess.TimeoutExpired:
+                    bk_error = fail(f"rbd snap create timed out after {timeout_snap}s")
+                    bk_results.append({
+                        "vm":     vm_name,
+                        "image":  vm_image,
+                        "start":  now_str(),
+                        "end":    now_str(),
+                        "result": "FAIL",
+                        "error":  bk_error,
+                        "type":   actual_type,
+                        "size":   0,
+                    })
+                    continue
 
                 # Export diff
                 if actual_type == "full":
@@ -378,7 +394,23 @@ def main():
                 lg(" ".join(cmd_export))
                 vm_started = now_str()
                 # stderr separato per catturare errori; stdout va diretto al terminale
-                proc = subprocess.run(cmd_export, stderr=subprocess.PIPE, text=True)
+                try:
+                    proc = subprocess.run(cmd_export, stderr=subprocess.PIPE,
+                                          text=True, timeout=timeout_export)
+                except subprocess.TimeoutExpired:
+                    vm_ended = now_str()
+                    bk_error = fail(f"rbd export-diff timed out after {timeout_export}s")
+                    bk_results.append({
+                        "vm":     vm_name,
+                        "image":  vm_image,
+                        "start":  vm_started,
+                        "end":    vm_ended,
+                        "result": "FAIL",
+                        "error":  bk_error,
+                        "type":   actual_type,
+                        "size":   0,
+                    })
+                    continue
                 vm_ended   = now_str()
 
                 bk_file = backup_dir / incset
