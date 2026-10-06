@@ -114,22 +114,24 @@ def get_backup_state(image_dir):
       image_dir/000001/000001  ← primo incrementale
     latest_full_idx = valore numerico dell'ultima cartella di primo livello
     vm_inc          = numero di voci nella cartella più recente (escluso 000000)
+    empty           = file a 0 byte nella cartella più recente (catena rotta)
     """
     if not image_dir.exists():
-        return 0, 0
+        return 0, 0, []
 
     full_dirs = sorted(
         d for d in image_dir.iterdir()
         if d.is_dir() and d.name.isdigit()
     )
     if not full_dirs:
-        return 0, 0
+        return 0, 0, []
 
     latest    = full_dirs[-1]
     latest_full_idx = int(latest.name)
-    inc_items = [d for d in latest.iterdir() if d.name.isdigit() and d.name != "000000"]
-    vm_inc    = len(inc_items)
-    return latest_full_idx, vm_inc
+    items     = [d for d in latest.iterdir() if d.name.isdigit()]
+    vm_inc    = len([d for d in items if d.name != "000000"])
+    empty     = sorted(d.name for d in items if d.is_file() and d.stat().st_size == 0)
+    return latest_full_idx, vm_inc, empty
 
 
 # ──────────────────────────────────────────────────────────── email ──
@@ -199,10 +201,14 @@ def build_report_html(job_name: str, results: list, failed: bool) -> str:
 
 # ──────────────────────────────────────────────────────── log file ──
 
-def write_log(log_dir, lines):
-    log_dir.mkdir(parents=True, exist_ok=True)
-    fname = datetime.now().strftime("%Y%m%d_%H%M%S") + ".log"
-    (log_dir / fname).write_text("\n".join(lines) + "\n")
+def append_log(log_file: Path, line: str):
+    """Scrive subito la riga su file, così un crash non fa perdere il log."""
+    try:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_file, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"WARNING: cannot write log {log_file}: {e}", file=sys.stderr)
 
 
 # ────────────────────────────────────────────────────────── main ──
@@ -222,11 +228,11 @@ def main():
         job_path = job["path"]
         job_dir  = Path(job_path) / job_name
         log_dir  = job_dir / "LOGS"
-        lines    = []   # accumula righe di log per questo job
+        log_file = log_dir / (datetime.now().strftime("%Y%m%d_%H%M%S") + ".log")
 
         def lg(msg: str):
-            print(msg)
-            lines.append(f"[{now_str()}] {msg}")
+            print(msg, flush=True)
+            append_log(log_file, f"[{now_str()}] {msg}")
 
         lg(f"{'='*60}")
         lg(f"Job: {job_name}")
@@ -240,12 +246,10 @@ def main():
 
         if days_ok and cur_day not in days_ok:
             lg(f"Skipping: not scheduled for day {cur_day}")
-            write_log(log_dir, lines)
             continue
 
         if weeks_ok and cur_week not in weeks_ok:
             lg(f"Skipping: not scheduled for week {cur_week}")
-            write_log(log_dir, lines)
             continue
 
         # ── mount check ────────────────────────────────────────────
@@ -257,7 +261,6 @@ def main():
                 lg(err)
                 send_email(job, f"[FAIL] CEPH Backup {job_name} (ALL objects)",
                            f"<h3>{err}</h3>")
-                write_log(log_dir, lines)
                 continue
             lg("Mountpoint OK")
 
@@ -269,7 +272,6 @@ def main():
             lg(err)
             send_email(job, f"[FAIL] CEPH Backup {job_name} (ALL objects)",
                        f"<h3>{err}</h3>")
-            write_log(log_dir, lines)
             continue
 
         # ── backup starts ──────────────────────────────────────────
@@ -278,7 +280,6 @@ def main():
 
         if not job_dir.exists():
             lg(f"ERROR: job directory not found: {job_dir}")
-            write_log(log_dir, lines)
             continue
 
         # Scopre VM scansionando la cartella del job
@@ -318,180 +319,212 @@ def main():
                 lg(f"Fallback: using existing dirs as image names: {images}")
 
             for vm_image in images:
-                image_dir = vm_dir / vm_image
-                vm_full, vm_inc = get_backup_state(image_dir)
-
-                # Tipo di backup
-                if vm_full == 0:
-                    lg(f"FIRST backup for VM {vm_name} image {vm_image}")
-                    backup_type = "full"
-                    vm_inc  = 0
-                    vm_full = 1          # prima cartella: 000001
-                elif vm_inc >= max_inc:
-                    lg(f"Max INC reached {vm_inc}/{max_inc} for VM {vm_name} — new FULL")
-                    backup_type = "full"
-                    vm_inc  = 0
-                    vm_full += 1         # prossima cartella: indice + 1
-                else:
-                    lg(f"INC {vm_inc}/{max_inc} for VM {vm_name}")
-                    backup_type = "inc"
-                    vm_inc += 1
-
-                indir       = str(vm_full).zfill(6)
-                incset      = str(vm_inc).zfill(6)
-                incset_prev = str(vm_inc - 1).zfill(6)
-
-                backup_dir = image_dir / indir
-                backup_dir.mkdir(parents=True, exist_ok=True)
-
-                actual_type = backup_type
-                # Se inc ma non esiste il full → esegui full
-                if backup_type == "inc" and not (backup_dir / "000000").exists():
-                    lg("No previous FULL found, performing FULL instead of INC")
-                    actual_type = "full"
-                    vm_inc  = 0
-                    incset  = "000000"
-
-                # Crea snapshot CEPH
-                snap_name        = f"{snap_prefix}-{indir}-{incset}"
-                timeout_snap     = job.get("timeout_snap",   120)
-                timeout_export   = job.get("timeout_export", 7200)
-                cmd_snap  = ["rbd", "snap", "create",
-                             f"{pool}/{vm_image}", "--snap", snap_name]
-                lg(" ".join(cmd_snap))
+                vm_started  = now_str()
+                actual_type = "-"
                 try:
-                    subprocess.run(cmd_snap, check=False, timeout=timeout_snap)
-                except subprocess.TimeoutExpired:
-                    bk_error = fail(f"rbd snap create timed out after {timeout_snap}s")
+                    image_dir = vm_dir / vm_image
+                    vm_full, vm_inc, empty = get_backup_state(image_dir)
+
+                    # Tipo di backup
+                    if vm_full == 0:
+                        lg(f"FIRST backup for VM {vm_name} image {vm_image}")
+                        backup_type = "full"
+                        vm_inc  = 0
+                        vm_full = 1          # prima cartella: 000001
+                    elif empty:
+                        lg(f"Empty file(s) {', '.join(empty)} in set {str(vm_full).zfill(6)} "
+                           f"for VM {vm_name} — chain broken, new FULL")
+                        backup_type = "full"
+                        vm_inc  = 0
+                        vm_full += 1
+                    elif vm_inc >= max_inc:
+                        lg(f"Max INC reached {vm_inc}/{max_inc} for VM {vm_name} — new FULL")
+                        backup_type = "full"
+                        vm_inc  = 0
+                        vm_full += 1         # prossima cartella: indice + 1
+                    else:
+                        lg(f"INC {vm_inc}/{max_inc} for VM {vm_name}")
+                        backup_type = "inc"
+                        vm_inc += 1
+
+                    indir       = str(vm_full).zfill(6)
+                    incset      = str(vm_inc).zfill(6)
+                    incset_prev = str(vm_inc - 1).zfill(6)
+
+                    backup_dir = image_dir / indir
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+
+                    actual_type = backup_type
+                    # Se inc ma non esiste il full → esegui full
+                    if backup_type == "inc" and not (backup_dir / "000000").exists():
+                        lg("No previous FULL found, performing FULL instead of INC")
+                        actual_type = "full"
+                        vm_inc  = 0
+                        incset  = "000000"
+
+                    snap_name      = f"{snap_prefix}-{indir}-{incset}"
+                    timeout_snap   = job.get("timeout_snap",   120)
+                    timeout_export = job.get("timeout_export", 7200)
+                    bk_file        = backup_dir / incset
+
+                    def cleanup_fail():
+                        """Rimuove il file esportato (eventualmente incompleto) e la cartella se vuota."""
+                        # Il file può essere già immutabile lato target (bklock.py): non deve far crashare il job
+                        try:
+                            if bk_file.exists():
+                                bk_file.unlink()
+                                lg(f"Removed incomplete export file: {bk_file}")
+                        except OSError as e:
+                            lg(f"WARNING: cannot remove {bk_file}: {e}")
+                        try:
+                            backup_dir.rmdir()
+                            lg(f"Removed empty backup dir: {backup_dir}")
+                        except OSError:
+                            pass
+
+                    def fail(error_msg: str):
+                        nonlocal BACKUP_FAIL
+                        lg(f"ERROR: {error_msg}")
+                        BACKUP_FAIL = True
+                        cleanup_fail()
+                        cmd_rm = ["rbd", "snap", "rm", f"{pool}/{vm_image}@{snap_name}"]
+                        lg(" ".join(cmd_rm))
+                        subprocess.run(cmd_rm, check=False, timeout=timeout_snap)
+                        vmb = load_vmbackup(vm_dir)
+                        vmb["lastrun"] = now_str()
+                        vmb["success"] = 0
+                        save_vmbackup(vm_dir, vmb)
+                        return error_msg
+
+                    # Crea snapshot CEPH
+                    cmd_snap = ["rbd", "snap", "create",
+                                f"{pool}/{vm_image}", "--snap", snap_name]
+                    lg(" ".join(cmd_snap))
+                    try:
+                        subprocess.run(cmd_snap, check=False, timeout=timeout_snap)
+                    except subprocess.TimeoutExpired:
+                        bk_error = fail(f"rbd snap create timed out after {timeout_snap}s")
+                        bk_results.append({
+                            "vm":     vm_name,
+                            "image":  vm_image,
+                            "start":  vm_started,
+                            "end":    now_str(),
+                            "result": "FAIL",
+                            "error":  bk_error,
+                            "type":   actual_type,
+                            "size":   0,
+                        })
+                        continue
+
+                    # Export diff
+                    if actual_type == "full":
+                        cmd_export = [
+                            "rbd", "export-diff",
+                            f"{pool}/{vm_image}@{snap_name}",
+                            str(bk_file),
+                        ]
+                    else:
+                        prev_snap  = f"{snap_prefix}-{indir}-{incset_prev}"
+                        cmd_export = [
+                            "rbd", "export-diff",
+                            "--from-snap", prev_snap,
+                            f"{pool}/{vm_image}@{snap_name}",
+                            str(bk_file),
+                        ]
+
+                    lg(" ".join(cmd_export))
+                    vm_started = now_str()
+                    # stderr separato per catturare errori; stdout va diretto al terminale
+                    try:
+                        proc = subprocess.run(cmd_export, stderr=subprocess.PIPE,
+                                              text=True, timeout=timeout_export)
+                    except subprocess.TimeoutExpired:
+                        bk_error = fail(f"rbd export-diff timed out after {timeout_export}s")
+                        bk_results.append({
+                            "vm":     vm_name,
+                            "image":  vm_image,
+                            "start":  vm_started,
+                            "end":    now_str(),
+                            "result": "FAIL",
+                            "error":  bk_error,
+                            "type":   actual_type,
+                            "size":   0,
+                        })
+                        continue
+                    vm_ended = now_str()
+
+                    if proc.returncode != 0:
+                        err_lines = [l for l in proc.stderr.splitlines() if l.strip()]
+                        bk_error  = fail(err_lines[-1] if err_lines else "unknown error")
+                        bk_size   = 0
+                        res_str   = "FAIL"
+
+                    else:
+                        bk_size = bk_file.stat().st_size if bk_file.exists() else 0
+
+                        if bk_size == 0:
+                            bk_error = fail("export file is empty (0 bytes)")
+                            res_str  = "FAIL"
+
+                        else:
+                            lg(f"{vm_name} backup SUCCESS ({bk_size} bytes)")
+                            res_str  = "SUCCESS"
+                            bk_error = ""
+
+                            vmb = load_vmbackup(vm_dir)
+                            vmb["lastrun"] = vm_ended
+                            vmb["success"] = 1
+                            save_vmbackup(vm_dir, vmb)
+
+                            # Copia definizione XML VM in VMDEF (dentro la cartella della VM)
+                            vmdef_dir = vm_dir / "VMDEF" / indir / incset
+                            xml_src   = Path(vm_cfg_path) / f"{vm_name}.xml"
+                            if xml_src.exists():
+                                try:
+                                    vmdef_dir.mkdir(parents=True, exist_ok=True)
+                                    shutil.copy2(xml_src, vmdef_dir / f"{vm_name}.xml")
+                                    lg(f"VM definition copied to {vmdef_dir}/{vm_name}.xml")
+                                except OSError as e:
+                                    bk_error = f"WARNING: cannot copy VM definition: {e}"
+                                    lg(bk_error)
+                            else:
+                                bk_error = f"WARNING: VM definition not found at {xml_src}"
+                                lg(bk_error)
+
+                    # Riga di log per questa immagine
+                    lg(f"LOG | job={job_name} vm={vm_name} image={vm_image} "
+                       f"type={actual_type} result={res_str} "
+                       f"start={vm_started} end={vm_ended} "
+                       f"path={backup_dir}/ size={bk_size} "
+                       f"cmd={' '.join(cmd_export)}"
+                       + (f" error={bk_error}" if bk_error else ""))
+
                     bk_results.append({
                         "vm":     vm_name,
                         "image":  vm_image,
-                        "start":  now_str(),
+                        "start":  vm_started,
+                        "end":    vm_ended,
+                        "result": res_str,
+                        "error":  bk_error,
+                        "type":   actual_type,
+                        "size":   bk_size,
+                    })
+
+                except Exception as e:
+                    # Un errore imprevisto su un'immagine non deve lasciare il job bloccato
+                    BACKUP_FAIL = True
+                    bk_error = f"unexpected error: {e!r}"
+                    lg(f"ERROR: {vm_name}/{vm_image} {bk_error}")
+                    bk_results.append({
+                        "vm":     vm_name,
+                        "image":  vm_image,
+                        "start":  vm_started,
                         "end":    now_str(),
                         "result": "FAIL",
                         "error":  bk_error,
                         "type":   actual_type,
                         "size":   0,
                     })
-                    continue
-
-                # Export diff
-                if actual_type == "full":
-                    cmd_export = [
-                        "rbd", "export-diff",
-                        f"{pool}/{vm_image}@{snap_name}",
-                        str(backup_dir / incset),
-                    ]
-                else:
-                    prev_snap  = f"{snap_prefix}-{indir}-{incset_prev}"
-                    cmd_export = [
-                        "rbd", "export-diff",
-                        "--from-snap", prev_snap,
-                        f"{pool}/{vm_image}@{snap_name}",
-                        str(backup_dir / incset),
-                    ]
-
-                lg(" ".join(cmd_export))
-                vm_started = now_str()
-                # stderr separato per catturare errori; stdout va diretto al terminale
-                try:
-                    proc = subprocess.run(cmd_export, stderr=subprocess.PIPE,
-                                          text=True, timeout=timeout_export)
-                except subprocess.TimeoutExpired:
-                    vm_ended = now_str()
-                    bk_error = fail(f"rbd export-diff timed out after {timeout_export}s")
-                    bk_results.append({
-                        "vm":     vm_name,
-                        "image":  vm_image,
-                        "start":  vm_started,
-                        "end":    vm_ended,
-                        "result": "FAIL",
-                        "error":  bk_error,
-                        "type":   actual_type,
-                        "size":   0,
-                    })
-                    continue
-                vm_ended   = now_str()
-
-                bk_file = backup_dir / incset
-
-                def cleanup_fail():
-                    """Rimuove il file esportato (eventualmente incompleto) e la cartella se vuota."""
-                    if bk_file.exists():
-                        bk_file.unlink()
-                        lg(f"Removed incomplete export file: {bk_file}")
-                    try:
-                        backup_dir.rmdir()
-                        lg(f"Removed empty backup dir: {backup_dir}")
-                    except OSError:
-                        pass
-
-                def fail(error_msg: str):
-                    nonlocal BACKUP_FAIL
-                    lg(f"ERROR: {error_msg}")
-                    BACKUP_FAIL = True
-                    cleanup_fail()
-                    cmd_rm = ["rbd", "snap", "rm", f"{pool}/{vm_image}@{snap_name}"]
-                    lg(" ".join(cmd_rm))
-                    subprocess.run(cmd_rm, check=False)
-                    vmb = load_vmbackup(vm_dir)
-                    vmb["lastrun"] = vm_ended
-                    vmb["success"] = 0
-                    save_vmbackup(vm_dir, vmb)
-                    return error_msg
-
-                if proc.returncode != 0:
-                    err_lines = [l for l in proc.stderr.splitlines() if l.strip()]
-                    bk_error  = fail(err_lines[-1] if err_lines else "unknown error")
-                    bk_size   = 0
-                    res_str   = "FAIL"
-
-                else:
-                    bk_size = bk_file.stat().st_size if bk_file.exists() else 0
-
-                    if bk_size == 0:
-                        bk_error = fail("export file is empty (0 bytes)")
-                        res_str  = "FAIL"
-
-                    else:
-                        lg(f"{vm_name} backup SUCCESS ({bk_size} bytes)")
-                        res_str  = "SUCCESS"
-                        bk_error = ""
-
-                        vmb = load_vmbackup(vm_dir)
-                        vmb["lastrun"] = vm_ended
-                        vmb["success"] = 1
-                        save_vmbackup(vm_dir, vmb)
-
-                        # Copia definizione XML VM in VMDEF (dentro la cartella della VM)
-                        vmdef_dir = vm_dir / "VMDEF" / indir / incset
-                        xml_src   = Path(vm_cfg_path) / f"{vm_name}.xml"
-                        if xml_src.exists():
-                            vmdef_dir.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(xml_src, vmdef_dir / f"{vm_name}.xml")
-                            lg(f"VM definition copied to {vmdef_dir}/{vm_name}.xml")
-                        else:
-                            bk_error = f"WARNING: VM definition not found at {xml_src}"
-                            lg(bk_error)
-
-                # Riga di log per questa immagine
-                lg(f"LOG | job={job_name} vm={vm_name} image={vm_image} "
-                   f"type={actual_type} result={res_str} "
-                   f"start={vm_started} end={vm_ended} "
-                   f"path={backup_dir}/ size={bk_size} "
-                   f"cmd={' '.join(cmd_export)}"
-                   + (f" error={bk_error}" if bk_error else ""))
-
-                bk_results.append({
-                    "vm":     vm_name,
-                    "image":  vm_image,
-                    "start":  vm_started,
-                    "end":    vm_ended,
-                    "result": res_str,
-                    "error":  bk_error,
-                    "type":   actual_type,
-                    "size":   bk_size,
-                })
 
         # ── job completato ─────────────────────────────────────────
         job["lastcompletion"] = now_str()
@@ -500,7 +533,6 @@ def main():
         # Aggiorna lastbk.txt (usato dal TARGETSIDE per l'immutabilità)
         (job_dir / "lastbk.txt").write_text(job["lastcompletion"])
 
-        write_log(log_dir, lines)
 
         # Email di report
         if bk_results:
