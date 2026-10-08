@@ -7,6 +7,7 @@ Versione databaseless di bkexec.php. Da mettere in cron daily.
 """
 
 import configparser
+import filecmp
 import json
 import os
 import shutil
@@ -479,11 +480,15 @@ def main():
                             # Copia definizione XML VM in VMDEF (dentro la cartella della VM)
                             vmdef_dir = vm_dir / "VMDEF" / indir / incset
                             xml_src   = Path(vm_cfg_path) / f"{vm_name}.xml"
+                            xml_dst   = vmdef_dir / f"{vm_name}.xml"
                             if xml_src.exists():
                                 try:
-                                    vmdef_dir.mkdir(parents=True, exist_ok=True)
-                                    shutil.copy2(xml_src, vmdef_dir / f"{vm_name}.xml")
-                                    lg(f"VM definition copied to {vmdef_dir}/{vm_name}.xml")
+                                    if xml_dst.exists() and filecmp.cmp(xml_src, xml_dst, shallow=False):
+                                        lg(f"VM definition already up to date at {xml_dst}")
+                                    else:
+                                        vmdef_dir.mkdir(parents=True, exist_ok=True)
+                                        shutil.copy2(xml_src, xml_dst)
+                                        lg(f"VM definition copied to {xml_dst}")
                                 except OSError as e:
                                     bk_error = f"WARNING: cannot copy VM definition: {e}"
                                     lg(bk_error)

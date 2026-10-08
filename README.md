@@ -174,7 +174,7 @@ Scripts to deploy on the backup target server:
 
 | File | Purpose |
 |------|---------|
-| `bklock.py` | Applies `chattr +i` recursively to all backup files (excludes `vmbackup.json`) |
+| `bklock.py` | Applies `chattr +i` recursively to all backup files (excludes `vmbackup.json` and `VMDEF/`, which stay writable) |
 | `bkretention.py` | Applies retention on the target side |
 | `config.ini` | `retention`, `jobname`, `email_from`, `rcpt_to` |
 

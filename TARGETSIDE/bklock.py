@@ -2,7 +2,7 @@
 """
 bklock.py — applica ricorsivamente il flag IMMUTABLE (chattr +i)
 a tutti i file del backup lato TARGET.
-Esclude i file vmbackup.json (devono restare scrivibili).
+Esclude i file vmbackup.json e le cartelle VMDEF (devono restare scrivibili).
 Da mettere in cron.
 
 © 2025 — GPLv3
@@ -16,6 +16,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 
 SKIP_FILES = {"vmbackup.json"}
+SKIP_DIRS  = {"VMDEF"}
 
 
 def chattr(flag: str, path: Path):
@@ -25,6 +26,11 @@ def chattr(flag: str, path: Path):
 def recurse_folder(path: Path):
     for entry in sorted(path.iterdir()):
         if entry.is_dir():
+            if entry.name in SKIP_DIRS:
+                # bkexec.py deve poter aggiornare gli XML: sblocca anche quelli bloccati in passato
+                print(f"skip immutable (excluded dir): {entry}")
+                subprocess.run(["chattr", "-R", "-i", str(entry)], check=False)
+                continue
             recurse_folder(entry)
         else:
             if entry.name in SKIP_FILES:
