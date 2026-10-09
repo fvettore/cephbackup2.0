@@ -20,6 +20,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
 TMP_DIR    = SCRIPT_DIR / 'tmp'
+RESTORE_LOG_DIR = SCRIPT_DIR / 'RESTORELOGS'
 SKIP_DIRS  = {"LOGS", "VMDEF"}
 
 # ── Colori ────────────────────────────────────────────────────────────────────
@@ -709,39 +710,55 @@ def screen_restore_run(stdscr, config, vm_name, point, images):
     restored_names = [f"{img}_rest-{date_suffix}" for img in images]
 
     lv = LogView(stdscr, f"Restore — {vm_name} → {point['restpoint']}")
-    lv.log(f"Job:           {point['job']}")
-    lv.log(f"Restore point: {point['restpoint']}  ({point['date'].strip()})")
-    lv.log(f"Images:        {', '.join(images)}")
-    lv.log(f"Destination:   {', '.join(restored_names)}")
-    lv.log("─" * 60)
+    started  = datetime.now()
+    log_file = RESTORE_LOG_DIR / f"{started:%Y%m%d_%H%M%S}_{vm_name}.log"
 
-    result = do_restore(config, vm_name, point, images, lv.log, lv.log_progress)
+    def log(msg, color=0):
+        lv.log(msg, color)
+        try:
+            RESTORE_LOG_DIR.mkdir(exist_ok=True)
+            with open(log_file, 'a') as f:
+                f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+        except OSError:
+            pass
 
-    lv.log("─" * 60)
+    log(f"VM:            {vm_name}")
+    log(f"Job:           {point['job']}")
+    log(f"Restore point: {point['restpoint']}  ({point['date'].strip()})")
+    log(f"Images:        {', '.join(images)}")
+    log(f"Destination:   {', '.join(restored_names)}")
+    log("─" * 60)
+
+    result = do_restore(config, vm_name, point, images, log, lv.log_progress)
+
+    elapsed = int((datetime.now() - started).total_seconds())
+    log("─" * 60)
+    log(f"Total time:    {elapsed // 60}m {elapsed % 60:02d}s")
+    log(f"Restore log:   {log_file}", C_DIM)
     if result.get('error') and not result.get('restored_images'):
-        lv.log(f"FAILED: {result['error']}", C_ERR)
+        log(f"FAILED: {result['error']}", C_ERR)
         lv.done(success=False)
         return
 
     if result.get('virsh_ok'):
         vm_rest_name = f"{vm_name}_rest-{date_suffix}"
-        lv.log(f"VM '{vm_rest_name}' defined successfully.", C_OK)
-        lv.log(f"XML:  {result['xml_dest']}", C_DIM)
+        log(f"VM '{vm_rest_name}' defined successfully.", C_OK)
+        log(f"XML:  {result['xml_dest']}", C_DIM)
         if result.get('virsh_start'):
-            lv.log("VM started with network DISABLED.", C_OK)
-            lv.log("Re-enable network with:", C_DIM)
-            lv.log(f"  virsh domif-setlink {vm_rest_name} <iface> up", C_DIM)
+            log("VM started with network DISABLED.", C_OK)
+            log("Re-enable network with:", C_DIM)
+            log(f"  virsh domif-setlink {vm_rest_name} <iface> up", C_DIM)
         else:
-            lv.log(f"WARNING: VM start failed. {result.get('error', '')}", C_ERR)
-            lv.log(f"Start manually: virsh start {vm_rest_name}", C_DIM)
+            log(f"WARNING: VM start failed. {result.get('error', '')}", C_ERR)
+            log(f"Start manually: virsh start {vm_rest_name}", C_DIM)
         lv.done(success=result.get('virsh_start', False))
     else:
-        lv.log(f"Images restored: {', '.join(result['restored_images'].values())}", C_OK)
+        log(f"Images restored: {', '.join(result['restored_images'].values())}", C_OK)
         if result.get('error'):
-            lv.log(f"WARNING: {result['error']}", C_ERR)
+            log(f"WARNING: {result['error']}", C_ERR)
         if result.get('xml_dest'):
-            lv.log(f"XML saved to: {result['xml_dest']}", C_DIM)
-            lv.log("Run manually: virsh define " + result['xml_dest'], C_DIM)
+            log(f"XML saved to: {result['xml_dest']}", C_DIM)
+            log("Run manually: virsh define " + result['xml_dest'], C_DIM)
         lv.done(success=False)
 
 

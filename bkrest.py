@@ -20,9 +20,26 @@ import configparser
 import json
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
+RESTORE_LOG_DIR = SCRIPT_DIR / "RESTORELOGS"
+STARTED  = datetime.now()
+LOG_FILE = None
+
+
+def lg(msg=""):
+    """Stampa a video e scrive su RESTORELOGS con data/ora."""
+    print(msg)
+    if LOG_FILE is None:
+        return
+    try:
+        RESTORE_LOG_DIR.mkdir(exist_ok=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except OSError:
+        pass
 
 
 def load_config():
@@ -59,8 +76,9 @@ def find_vm_for_image(job_dir, image_name):
 
 def run(cmd):
     """Esegue un comando mostrando output live. Restituisce il return code."""
-    print(" ".join(cmd))
+    lg(" ".join(cmd))
     result = subprocess.run(cmd)
+    lg(f"  rc={result.returncode}")
     return result.returncode
 
 
@@ -74,10 +92,13 @@ def main():
     restore_point = sys.argv[3]
     restored_name = sys.argv[4]
 
+    global LOG_FILE
+    LOG_FILE = RESTORE_LOG_DIR / f"{STARTED:%Y%m%d_%H%M%S}_{restored_name}.log"
+
     # Valida formato RESTPOINT
     parts = restore_point.split("-")
     if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
-        print(f"ERROR: RESTPOINT deve essere nel formato 000001-000003")
+        lg(f"ERROR: RESTPOINT deve essere nel formato 000001-000003")
         sys.exit(1)
 
     instance = parts[0]   # es. 000001 (set full)
@@ -89,7 +110,7 @@ def main():
 
     job = find_job(jobs, job_name)
     if not job:
-        print(f"ERROR: job '{job_name}' non trovato in backupjobs.json")
+        lg(f"ERROR: job '{job_name}' non trovato in backupjobs.json")
         sys.exit(1)
 
     job_dir = Path(job["path"]) / job_name
@@ -97,42 +118,47 @@ def main():
     # Trova la VM che contiene l'immagine
     vm_name = find_vm_for_image(job_dir, vm_image)
     if not vm_name:
-        print(f"ERROR: immagine '{vm_image}' non trovata nel job '{job_name}'")
+        lg(f"ERROR: immagine '{vm_image}' non trovata nel job '{job_name}'")
         sys.exit(1)
 
     backup_path = job_dir / vm_name / vm_image / instance
     if not backup_path.is_dir():
-        print(f"ERROR: cartella backup non trovata: {backup_path}")
+        lg(f"ERROR: cartella backup non trovata: {backup_path}")
         sys.exit(1)
 
-    print(f"Job:          {job_name}")
-    print(f"VM:           {vm_name}")
-    print(f"Image:        {vm_image}")
-    print(f"Restore point: {restore_point}")
-    print(f"Backup path:  {backup_path}")
-    print(f"Destination:  {pool}/{restored_name}")
-    print()
+    lg(f"Job:          {job_name}")
+    lg(f"VM:           {vm_name}")
+    lg(f"Image:        {vm_image}")
+    lg(f"Restore point: {restore_point}")
+    lg(f"Backup path:  {backup_path}")
+    lg(f"Destination:  {pool}/{restored_name}")
+    lg()
 
     # Crea immagine RBD vuota di destinazione
-    print(f"Creating empty image {restored_name} ...")
+    lg(f"Creating empty image {restored_name} ...")
     rc = run(["rbd", "create", restored_name, "--size", "1024", "-p", pool])
     if rc != 0:
-        print(f"ERROR: rbd create fallito (rc={rc})")
+        lg(f"ERROR: rbd create fallito (rc={rc})")
         sys.exit(1)
 
     # Applica i diff dal full (000000) fino al punto richiesto
     for x in range(point + 1):
         diff_file = backup_path / str(x).zfill(6)
         if not diff_file.exists():
-            print(f"ERROR: file diff non trovato: {diff_file}")
+            lg(f"ERROR: file diff non trovato: {diff_file}")
             sys.exit(1)
-        print(f"\nImporting diff {diff_file} ...")
+        lg()
+        lg(f"Importing diff {diff_file} ...")
         rc = run(["rbd", "import-diff", str(diff_file), f"{pool}/{restored_name}"])
         if rc != 0:
-            print(f"ERROR: rbd import-diff fallito su {diff_file} (rc={rc})")
+            lg(f"ERROR: rbd import-diff fallito su {diff_file} (rc={rc})")
             sys.exit(1)
 
-    print(f"\nRestore completato: {pool}/{restored_name}")
+    elapsed = int((datetime.now() - STARTED).total_seconds())
+    lg()
+    lg(f"Restore completato: {pool}/{restored_name}")
+    lg(f"Tempo totale: {elapsed // 60}m {elapsed % 60:02d}s")
+    lg(f"Log: {LOG_FILE}")
 
 
 if __name__ == "__main__":
