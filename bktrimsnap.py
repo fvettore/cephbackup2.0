@@ -12,6 +12,7 @@ Da mettere in cron daily.
 
 import configparser
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,24 @@ def load_config() -> configparser.ConfigParser:
 def load_jobs() -> list:
     with open(SCRIPT_DIR / "backupjobs.json") as f:
         return json.load(f)
+
+
+def is_mounted(mountpoint: str, timeout: int = 15) -> bool:
+    """True se mountpoint è montato (match esatto) e risponde entro timeout secondi.
+    Un NFS hard con server irraggiungibile non deve bloccare lo script."""
+    mp = os.path.normpath(mountpoint)
+    try:
+        with open("/proc/mounts") as f:
+            if not any(line.split()[1] == mp for line in f):
+                return False
+    except OSError:
+        return False
+    try:
+        subprocess.run(["stat", "-f", mp], capture_output=True,
+                       timeout=timeout, check=True)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return False
+    return True
 
 
 # ── CEPH helpers ──────────────────────────────────────────────────────────────
@@ -99,6 +118,10 @@ def main():
         snap_prefix = job.get("snap-prefix", "BK")
         max_snaps   = job.get("max-snaps", 10)
         job_dir     = Path(job["path"]) / job_name
+
+        if job.get("checkmount") and not is_mounted(job.get("mountpoint", "")):
+            print(f"[{job_name}] mountpoint {job.get('mountpoint')} non montato o non risponde")
+            continue
 
         if not job_dir.is_dir():
             print(f"[{job_name}] directory non trovata: {job_dir}")

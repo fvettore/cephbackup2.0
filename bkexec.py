@@ -78,9 +78,22 @@ def save_vmbackup(vm_dir: Path, data: dict):
 
 # ──────────────────────────────────────────────────── backup logic ──
 
-def is_mounted(mountpoint: str) -> bool:
-    result = subprocess.run(["mount"], capture_output=True, text=True)
-    return mountpoint in result.stdout
+def is_mounted(mountpoint: str, timeout: int = 15) -> bool:
+    """True se mountpoint è montato (match esatto) e risponde entro timeout secondi.
+    Un NFS hard con server irraggiungibile non deve bloccare lo script."""
+    mp = os.path.normpath(mountpoint)
+    try:
+        with open("/proc/mounts") as f:
+            if not any(line.split()[1] == mp for line in f):
+                return False
+    except OSError:
+        return False
+    try:
+        subprocess.run(["stat", "-f", mp], capture_output=True,
+                       timeout=timeout, check=True)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return False
+    return True
 
 
 def get_vm_images(vm_name, vm_config_path):
@@ -235,10 +248,8 @@ def main():
             print(msg, flush=True)
             append_log(log_file, f"[{now_str()}] {msg}")
 
-        lg(f"{'='*60}")
-        lg(f"Job: {job_name}")
-
         # ── schedule check ─────────────────────────────────────────
+        # Solo print: un job non schedulato non deve toccare il target
         sched     = job.get("schedule", {})
         days_ok   = sched.get("days",  list(range(1, 8)))
         weeks_ok  = sched.get("weeks", list(range(1, 6)))
@@ -246,24 +257,30 @@ def main():
         cur_week  = week_of_month()
 
         if days_ok and cur_day not in days_ok:
-            lg(f"Skipping: not scheduled for day {cur_day}")
+            print(f"[{job_name}] Skipping: not scheduled for day {cur_day}", flush=True)
             continue
 
         if weeks_ok and cur_week not in weeks_ok:
-            lg(f"Skipping: not scheduled for week {cur_week}")
+            print(f"[{job_name}] Skipping: not scheduled for week {cur_week}", flush=True)
             continue
 
         # ── mount check ────────────────────────────────────────────
+        # Prima di lg(): il log sta sul target, se il mount è bloccato
+        # anche la scrittura del log resterebbe appesa.
         if job.get("checkmount"):
             mp = job.get("mountpoint", "")
-            lg(f"Checking mountpoint {mp} ...")
+            print(f"[{job_name}] Checking mountpoint {mp} ...", flush=True)
             if not is_mounted(mp):
-                err = f"Mountpoint {mp} not mounted"
-                lg(err)
+                err = f"Mountpoint {mp} not mounted or not responding"
+                print(f"[{job_name}] {err}", flush=True)
                 send_email(job, f"[FAIL] CEPH Backup {job_name} (ALL objects)",
                            f"<h3>{err}</h3>")
                 continue
-            lg("Mountpoint OK")
+
+        lg(f"{'='*60}")
+        lg(f"Job: {job_name}")
+        if job.get("checkmount"):
+            lg(f"Mountpoint {job.get('mountpoint', '')} OK")
 
         # ── lock check ─────────────────────────────────────────────
         last_run   = job.get("lastrun")
