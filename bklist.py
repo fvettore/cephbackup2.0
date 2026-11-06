@@ -15,6 +15,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import bkcrypt
+
 SCRIPT_DIR = Path(__file__).parent
 
 
@@ -72,12 +74,14 @@ def list_restore_points(vm_name, jobs):
                 indir = full_dir.name
                 # Cartelle di secondo livello (000000=full, 000001+=inc)
                 inc_entries = sorted(
-                    e for e in full_dir.iterdir()
-                    if e.is_file() and e.name.isdigit() and len(e.name) == 6
+                    (e for e in full_dir.iterdir()
+                     if e.is_file() and bkcrypt.backup_index(e.name)),
+                    key=lambda e: e.name,
                 )
                 for entry in inc_entries:
-                    incset  = entry.name
+                    incset  = bkcrypt.backup_index(entry.name)
                     bktype  = "FULL" if incset == "000000" else "INC "
+                    bktype += "*" if entry.name.endswith(bkcrypt.ENC_SUFFIX) else " "
                     mtime   = datetime.fromtimestamp(entry.stat().st_mtime)
                     fdate   = mtime.strftime("%d-%m-%Y %H:%M:%S")
                     size    = entry.stat().st_size

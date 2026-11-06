@@ -8,3 +8,4 @@ backupjobs.json
 backupjobs.json.bk
 RESTORELOGS/
 *.bak-*
+*.key

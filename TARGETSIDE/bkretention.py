@@ -136,7 +136,8 @@ def latest_mtime(image_dir: Path) -> Optional[datetime]:
         if not bkset.is_dir() or not bkset.name.isdigit():
             continue
         for f in bkset.iterdir():
-            if f.is_file() and f.name.isdigit():
+            # 000003 in chiaro o 000003.gpg cifrato
+            if f.is_file() and f.name.split(".")[0].isdigit():
                 mt = datetime.fromtimestamp(f.stat().st_mtime)
                 if latest is None or mt > latest:
                     latest = mt

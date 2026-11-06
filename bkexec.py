@@ -20,6 +20,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
+import bkcrypt
+
 SCRIPT_DIR = Path(__file__).parent
 
 
@@ -142,8 +144,8 @@ def get_backup_state(image_dir):
 
     latest    = full_dirs[-1]
     latest_full_idx = int(latest.name)
-    items     = [d for d in latest.iterdir() if d.name.isdigit()]
-    vm_inc    = len([d for d in items if d.name != "000000"])
+    items     = [d for d in latest.iterdir() if bkcrypt.backup_index(d.name)]
+    vm_inc    = len([d for d in items if bkcrypt.backup_index(d.name) != "000000"])
     empty     = sorted(d.name for d in items if d.is_file() and d.stat().st_size == 0)
     return latest_full_idx, vm_inc, empty
 
@@ -292,6 +294,22 @@ def main():
                        f"<h3>{err}</h3>")
             continue
 
+        # ── encryption check ───────────────────────────────────────
+        # Con encrypt attivo e chiave mancante il job fallisce: mai backup in chiaro per errore
+        key_file = None
+        if job.get("encrypt"):
+            key_file = bkcrypt.key_file_for(job)
+            if key_file is None:
+                err = (f"Encryption enabled but key file not found: "
+                       f"{job.get('encryption_key_file')}")
+                lg(f"ERROR: {err}")
+                send_email(job, f"[FAIL] CEPH Backup {job_name} (ALL objects)",
+                           f"<h3>{err}</h3>")
+                continue
+            if key_file.stat().st_mode & 0o077:
+                lg(f"WARNING: key file {key_file} is accessible by group/others (chmod 600)")
+            lg(f"Encryption: ON (key file {key_file})")
+
         # ── backup starts ──────────────────────────────────────────
         job["lastrun"] = now_str()
         save_jobs(jobs)
@@ -374,7 +392,7 @@ def main():
 
                     actual_type = backup_type
                     # Se inc ma non esiste il full → esegui full
-                    if backup_type == "inc" and not (backup_dir / "000000").exists():
+                    if backup_type == "inc" and not bkcrypt.backup_file(backup_dir, "000000").exists():
                         lg("No previous FULL found, performing FULL instead of INC")
                         actual_type = "full"
                         vm_inc  = 0
@@ -383,7 +401,7 @@ def main():
                     snap_name      = f"{snap_prefix}-{indir}-{incset}"
                     timeout_snap   = job.get("timeout_snap",   120)
                     timeout_export = job.get("timeout_export", 7200)
-                    bk_file        = backup_dir / incset
+                    bk_file        = backup_dir / (incset + (bkcrypt.ENC_SUFFIX if key_file else ""))
 
                     def cleanup_fail():
                         """Rimuove il file esportato (eventualmente incompleto) e la cartella se vuota."""
@@ -450,12 +468,20 @@ def main():
                             str(bk_file),
                         ]
 
-                    lg(" ".join(cmd_export))
+                    if key_file:
+                        cmd_stdout = cmd_export[:-1] + ["-"]
+                        lg(" ".join(cmd_stdout) + f" | gpg --symmetric -o {bk_file}")
+                    else:
+                        lg(" ".join(cmd_export))
                     vm_started = now_str()
                     # stderr separato per catturare errori; stdout va diretto al terminale
                     try:
-                        proc = subprocess.run(cmd_export, stderr=subprocess.PIPE,
-                                              text=True, timeout=timeout_export)
+                        if key_file:
+                            proc = bkcrypt.run_encrypted_export(cmd_stdout, bk_file,
+                                                                key_file, timeout_export)
+                        else:
+                            proc = subprocess.run(cmd_export, stderr=subprocess.PIPE,
+                                                  text=True, timeout=timeout_export)
                     except subprocess.TimeoutExpired:
                         bk_error = fail(f"rbd export-diff timed out after {timeout_export}s")
                         bk_results.append({
@@ -519,6 +545,7 @@ def main():
                        f"start={vm_started} end={vm_ended} "
                        f"path={backup_dir}/ size={bk_size} "
                        f"cmd={' '.join(cmd_export)}"
+                       + (" encrypted=1" if key_file else "")
                        + (f" error={bk_error}" if bk_error else ""))
 
                     bk_results.append({

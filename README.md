@@ -29,6 +29,8 @@ Every scheduled action proiduces a detailed email reporting relevant data:
 | `bkrest.py` | Performs restore (`./bkrest.py <JOB> <IMAGE> <RESTPOINT> <DEST-IMAGE-NAME>`) |
 | `bkretention.py` | Applies retention by deleting old backups (cron daily) |
 | `bktrimsnap.py` | Deletes obsolete CEPH snapshots (cron daily) |
+| `bkcrypt.py` | Optional backup encryption helpers (gpg), used by the other scripts |
+| `bkcheckkey.py` | Verifies that an encryption key opens the backups of a job (`./bkcheckkey.py JOB [VM] [--full] [--ask]`) |
 | `bkwatchdog.py` | Emails an alert when an enabled job has not completed for more than `alert_hours` (default 26) — catches hung runs (cron daily, after the backup window) |
 | `cephbackup_ui.py` | Interactive curses UI for restore management |
 | `config.ini` | CEPH pool, libvirt path, email settings |
@@ -161,6 +163,37 @@ virsh domif-setlink <vm>_rest-YYYYMMDD <iface> up
 ```
 
 ![Immagine 2025-02-13 083209](https://github.com/user-attachments/assets/7d61b792-b6d8-4b62-bab1-289e84b8829a)
+
+## Encryption (optional)
+
+Backups can be encrypted per job with `gpg` (AES256, symmetric passphrase). Enable it in `backupjobs.json` (or from the UI job editor):
+
+```json
+"encrypt": 1,
+"encryption_key_file": "/root/.cephbackup/keys/JOBNAME.key"
+```
+
+Create the key file (first line = passphrase) and keep a copy **outside the cluster** — without it encrypted backups cannot be restored:
+```bash
+install -d -m 700 /root/.cephbackup/keys
+openssl rand -base64 48 > /root/.cephbackup/keys/JOBNAME.key && chmod 600 /root/.cephbackup/keys/JOBNAME.key
+```
+
+- `rbd export-diff` is piped straight into `gpg`: no plaintext ever reaches the target
+- Encrypted files get the `.gpg` suffix (`000003.gpg`); plain files keep the bare name (`000003`)
+- **Mixed chains** are supported: enabling encryption on an existing job only encrypts new files; after a full retention cycle the job is fully encrypted
+- If `encrypt` is on and the key file is missing, the job fails (email) — it never falls back to plaintext
+- Restore (UI and `bkrest.py`) uses the key registered in the job; if none is registered (or it does not match) the key is asked interactively and checked before anything is created
+- `bklist.py` and the UI mark encrypted restore points with `*`
+- VM XML definitions in `VMDEF/` are not encrypted
+- From the UI (*Backup → job → Encryption*) you can toggle encryption, enter or generate the key (saved as a 600 file and registered in the job) and verify it against the latest backups. A new key is refused if it does not open the job's existing encrypted files
+
+Verify a key against the backups of a job:
+```bash
+./bkcheckkey.py JOB [VM]          # quick: decrypts the header of the latest file of each image
+./bkcheckkey.py JOB --full        # decrypts every file of the latest set (integrity check, slow)
+./bkcheckkey.py JOB --ask         # ask for the key even if one is registered (e.g. test the offline copy)
+```
 
 ## Retention
 

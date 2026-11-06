@@ -17,11 +17,14 @@ Esempio:
 """
 
 import configparser
+import getpass
 import json
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+import bkcrypt
 
 SCRIPT_DIR = Path(__file__).parent
 RESTORE_LOG_DIR = SCRIPT_DIR / "RESTORELOGS"
@@ -82,6 +85,35 @@ def run(cmd):
     return result.returncode
 
 
+def resolve_key(job, enc_files):
+    """
+    Chiave per i file cifrati: quella registrata nel job se valida,
+    altrimenti richiesta all'utente (3 tentativi). Restituisce (key_file, passphrase).
+    """
+    key_file = bkcrypt.key_file_for(job)
+    if key_file:
+        ok, msg = bkcrypt.check_key(enc_files[0], key_file=key_file)
+        if ok:
+            lg(f"Encryption key: file registrato nel job ({key_file}) — valida")
+            return key_file, None
+        lg(f"WARNING: la chiave registrata ({key_file}) non apre il backup: {msg}")
+    else:
+        lg("Encryption key: nessuna chiave registrata per il job")
+
+    if not sys.stdin.isatty():
+        lg("ERROR: backup cifrato e nessun terminale per chiedere la chiave")
+        sys.exit(1)
+    for attempt in range(1, 4):
+        passphrase = getpass.getpass(f"Chiave di cifratura per il job {job['name']}: ")
+        ok, msg = bkcrypt.check_key(enc_files[0], passphrase=passphrase)
+        if ok:
+            lg("Encryption key: inserita manualmente — valida")
+            return None, passphrase
+        lg(f"Chiave non valida (tentativo {attempt}/3): {msg}")
+    lg("ERROR: chiave non valida, restore annullato")
+    sys.exit(1)
+
+
 def main():
     if len(sys.argv) < 5:
         print(f"USAGE: {sys.argv[0]} JOB IMAGE RESTPOINT RESTORED-NAME")
@@ -134,6 +166,20 @@ def main():
     lg(f"Destination:  {pool}/{restored_name}")
     lg()
 
+    # Verifica che tutti i diff esistano prima di creare l'immagine
+    diff_files = [bkcrypt.backup_file(backup_path, str(x).zfill(6)) for x in range(point + 1)]
+    for diff_file in diff_files:
+        if not diff_file.exists():
+            lg(f"ERROR: file diff non trovato: {diff_file}")
+            sys.exit(1)
+
+    enc_files = [f for f in diff_files if bkcrypt.is_encrypted(f)]
+    key_file = passphrase = None
+    if enc_files:
+        lg(f"Backup cifrato: {len(enc_files)}/{len(diff_files)} file")
+        key_file, passphrase = resolve_key(job, enc_files)
+        lg()
+
     # Crea immagine RBD vuota di destinazione
     lg(f"Creating empty image {restored_name} ...")
     rc = run(["rbd", "create", restored_name, "--size", "1024", "-p", pool])
@@ -142,14 +188,18 @@ def main():
         sys.exit(1)
 
     # Applica i diff dal full (000000) fino al punto richiesto
-    for x in range(point + 1):
-        diff_file = backup_path / str(x).zfill(6)
-        if not diff_file.exists():
-            lg(f"ERROR: file diff non trovato: {diff_file}")
-            sys.exit(1)
+    for diff_file in diff_files:
         lg()
         lg(f"Importing diff {diff_file} ...")
-        rc = run(["rbd", "import-diff", str(diff_file), f"{pool}/{restored_name}"])
+        if diff_file in enc_files:
+            target = f"{pool}/{restored_name}"
+            lg(f"gpg --decrypt {diff_file} | rbd import-diff - {target}")
+            rc, errlines = bkcrypt.import_encrypted(diff_file, target, key_file, passphrase)
+            for line in errlines:
+                lg(f"  {line}")
+            lg(f"  rc={rc}")
+        else:
+            rc = run(["rbd", "import-diff", str(diff_file), f"{pool}/{restored_name}"])
         if rc != 0:
             lg(f"ERROR: rbd import-diff fallito su {diff_file} (rc={rc})")
             sys.exit(1)

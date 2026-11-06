@@ -18,6 +18,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import bkcrypt
+from bkexec import is_mounted
+
 SCRIPT_DIR = Path(__file__).parent
 TMP_DIR    = SCRIPT_DIR / 'tmp'
 RESTORE_LOG_DIR = SCRIPT_DIR / 'RESTORELOGS'
@@ -111,12 +114,15 @@ def fetch_restore_points(jobs: list, vm_name: str) -> list:
             for full_dir in full_dirs:
                 indir   = full_dir.name
                 entries = sorted(
-                    e for e in full_dir.iterdir()
-                    if e.is_file() and e.name.isdigit() and len(e.name) == 6
+                    (e for e in full_dir.iterdir()
+                     if e.is_file() and bkcrypt.backup_index(e.name)),
+                    key=lambda e: e.name,
                 )
                 for entry in entries:
-                    incset = entry.name
+                    incset = bkcrypt.backup_index(entry.name)
                     bktype = "FULL" if incset == "000000" else "INC "
+                    if entry.name.endswith(bkcrypt.ENC_SUFFIX):
+                        bktype += "*"
                     mtime  = datetime.fromtimestamp(entry.stat().st_mtime)
                     size   = entry.stat().st_size
                     if size >= 1_000_000_000:
@@ -162,15 +168,17 @@ def vmdef_exists(point: dict, vm_name: str) -> bool:
 
 # ── Logica di restore ─────────────────────────────────────────────────────────
 
-def run_rbd_import(cmd_args, log_progress_fn):
+def run_rbd_import(cmd_args, log_progress_fn, stdin=None):
     """
     Run rbd import-diff showing progress in real time.
     rbd uses \\r for progress lines (overwrites the same line)
     and \\n for error messages (permanent lines).
     Returns (returncode, list_of_error_lines).
     """
-    proc = subprocess.Popen(cmd_args, stdout=subprocess.DEVNULL,
+    proc = subprocess.Popen(cmd_args, stdin=stdin, stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE)
+    if stdin is not None:
+        stdin.close()   # la pipe resta solo a rbd: se rbd termina, gpg non resta bloccato
     cur_progress = ['']
     errlines     = []
 
@@ -259,7 +267,8 @@ def patch_xml(xml_content, vm_name, date_suffix, restored_images):
     return xml_content
 
 
-def do_restore(config, vm_name, point, images, log, log_progress):
+def do_restore(config, vm_name, point, images, log, log_progress,
+               key_file=None, passphrase=None):
     """
     Perform a full VM restore.
     images: list of images to restore (already selected by the user).
@@ -299,12 +308,20 @@ def do_restore(config, vm_name, point, images, log, log_progress):
 
         for x in range(point_int + 1):
             diff_file = str(x).zfill(6)
-            diff_path = str(backup_path / diff_file)
-            log(f"  import-diff .../{diff_file} → {poolname}/{restored_name}", C_DIM)
-            rc, errlines = run_rbd_import(
-                ['rbd', 'import-diff', diff_path, f"{poolname}/{restored_name}"],
-                log_progress_fn=log_progress,
-            )
+            diff_path = str(bkcrypt.backup_file(backup_path, diff_file))
+            target    = f"{poolname}/{restored_name}"
+            if bkcrypt.is_encrypted(diff_path):
+                log(f"  gpg --decrypt .../{diff_file} | import-diff → {target}", C_DIM)
+                rc, errlines = bkcrypt.import_encrypted(
+                    diff_path, target, key_file, passphrase,
+                    runner=lambda cmd, stdin: run_rbd_import(cmd, log_progress, stdin=stdin),
+                )
+            else:
+                log(f"  import-diff .../{diff_file} → {target}", C_DIM)
+                rc, errlines = run_rbd_import(
+                    ['rbd', 'import-diff', diff_path, target],
+                    log_progress_fn=log_progress,
+                )
             if rc != 0:
                 for line in errlines:
                     log(f"  {line}", C_ERR)
@@ -704,7 +721,8 @@ def select_images_dialog(stdscr, images: list, vmdef_missing: bool) -> list:
 
 # ── Schermate ─────────────────────────────────────────────────────────────────
 
-def screen_restore_run(stdscr, config, vm_name, point, images):
+def screen_restore_run(stdscr, config, vm_name, point, images,
+                       key_file=None, passphrase=None, encrypted=False):
     """Run the restore showing the live log."""
     date_suffix    = datetime.now().strftime('%Y%m%d')
     restored_names = [f"{img}_rest-{date_suffix}" for img in images]
@@ -727,9 +745,12 @@ def screen_restore_run(stdscr, config, vm_name, point, images):
     log(f"Restore point: {point['restpoint']}  ({point['date'].strip()})")
     log(f"Images:        {', '.join(images)}")
     log(f"Destination:   {', '.join(restored_names)}")
+    if encrypted:
+        log(f"Encryption:    {'key file ' + str(key_file) if key_file else 'key entered manually'}")
     log("─" * 60)
 
-    result = do_restore(config, vm_name, point, images, log, lv.log_progress)
+    result = do_restore(config, vm_name, point, images, log, lv.log_progress,
+                        key_file=key_file, passphrase=passphrase)
 
     elapsed = int((datetime.now() - started).total_seconds())
     log("─" * 60)
@@ -760,6 +781,43 @@ def screen_restore_run(stdscr, config, vm_name, point, images):
             log(f"XML saved to: {result['xml_dest']}", C_DIM)
             log("Run manually: virsh define " + result['xml_dest'], C_DIM)
         lv.done(success=False)
+
+
+def restore_key_dialog(stdscr, jobs, vm_name, point, images):
+    """
+    Se il restore point contiene file cifrati: usa la chiave registrata nel job
+    se valida, altrimenti la chiede (3 tentativi).
+    Restituisce dict per screen_restore_run, oppure None se annullato.
+    """
+    indir, incset = point['restpoint'].split('-')
+    files = [bkcrypt.backup_file(Path(point['job_path']) / point['job'] / vm_name / img / indir,
+                                 str(x).zfill(6))
+             for img in images for x in range(int(incset) + 1)]
+    enc = [f for f in files if f.is_file() and bkcrypt.is_encrypted(f)]
+    if not enc:
+        return {}
+
+    job      = next((j for j in jobs if j['name'] == point['job']), {})
+    key_file = bkcrypt.key_file_for(job)
+    if key_file:
+        ok, msg = bkcrypt.check_key(enc[0], key_file=key_file)
+        if ok:
+            return {'key_file': key_file, 'encrypted': True}
+        show_message(stdscr, "Encryption key",
+                     [f"The key registered for job {point['job']} does not open this backup:",
+                      msg, "", "Enter the key manually."], C_ERR)
+
+    for attempt in range(1, 4):
+        passphrase = edit_text_dialog(stdscr, f"Encryption key — job {point['job']}",
+                                      "", secret=True)
+        if passphrase is None:
+            return None
+        ok, msg = bkcrypt.check_key(enc[0], passphrase=passphrase)
+        if ok:
+            return {'passphrase': passphrase, 'encrypted': True}
+        show_message(stdscr, "Encryption key",
+                     [f"Invalid key (attempt {attempt}/3):", msg], C_ERR)
+    return None
 
 
 def screen_restore_points(stdscr, config, jobs, vm_name):
@@ -799,7 +857,7 @@ def screen_restore_points(stdscr, config, jobs, vm_name):
             title=f"Restore point — {vm_name}",
             items=labels,
             header=header,
-            hint="↑↓ navigate   Enter restore   q back",
+            hint="↑↓ navigate   Enter restore   q back   (* = encrypted)",
         )
         if idx is None:
             return
@@ -837,7 +895,10 @@ def screen_restore_points(stdscr, config, jobs, vm_name):
             info_lines += ["", "WARNING: no XML found — virsh define will not be run."]
 
         if confirm_dialog(stdscr, "Confirm restore", info_lines):
-            screen_restore_run(stdscr, config, vm_name, point, images)
+            key = restore_key_dialog(stdscr, jobs, vm_name, point, images)
+            if key is None:
+                continue
+            screen_restore_run(stdscr, config, vm_name, point, images, **key)
 
 
 def screen_vm_list(stdscr, config, jobs):
@@ -868,7 +929,7 @@ def screen_vm_list(stdscr, config, jobs):
 
 # ── Widget: input testuale modale ────────────────────────────────────────────
 
-def edit_text_dialog(stdscr, title: str, current: str) -> str:
+def edit_text_dialog(stdscr, title: str, current: str, secret: bool = False) -> str:
     """
     Modal text input. Returns the new value (string) or None if cancelled.
     Left/right arrows and Backspace/Delete supported.
@@ -899,7 +960,7 @@ def edit_text_dialog(stdscr, title: str, current: str) -> str:
             pass
 
         field_w = box_w - 6
-        text    = ''.join(buf)
+        text    = '*' * len(buf) if secret else ''.join(buf)
         # scroll the view to keep cursor visible
         start   = max(0, cur - field_w + 1)
         display = text[start:start + field_w]
@@ -1024,6 +1085,8 @@ JOB_FIELDS = [
     ("max_inc",     "Max incrementals",    "int"),
     ("snap-prefix", "Snapshot prefix",     "str"),
     ("max-snaps",   "Max snapshots",       "int"),
+    ("encrypt",     "Encryption",          "bool"),
+    ("encryption_key_file", "Encryption key file", "str"),
     ("_days",       "Scheduled days",      "days"),
     ("_weeks",      "Scheduled weeks",     "weeks"),
     ("email_from",  "Sender email",        "str"),
@@ -1372,9 +1435,165 @@ def screen_vm_list_for_job(stdscr, config: dict, job: dict):
 
 # ── Schermata: menu job ───────────────────────────────────────────────────────
 
+# ── Schermata: gestione chiave di cifratura del job ──────────────────────────
+
+def _job_dir_reachable(stdscr, job) -> bool:
+    if job.get("checkmount") and not is_mounted(job.get("mountpoint", "")):
+        show_message(stdscr, "Encryption",
+                     [f"Mountpoint {job.get('mountpoint')} not mounted or not responding."], C_ERR)
+        return False
+    return True
+
+
+def ask_new_key(stdscr):
+    key = edit_text_dialog(stdscr, "New encryption key", "", secret=True)
+    if key is None:
+        return None
+    if len(key) < bkcrypt.MIN_KEY_LEN:
+        show_message(stdscr, "Encryption key",
+                     [f"The key must be at least {bkcrypt.MIN_KEY_LEN} characters."], C_ERR)
+        return None
+    again = edit_text_dialog(stdscr, "Confirm encryption key", "", secret=True)
+    if again is None:
+        return None
+    if again != key:
+        show_message(stdscr, "Encryption key", ["The two keys do not match."], C_ERR)
+        return None
+    return key
+
+
+def save_job_key(stdscr, jobs, job, key, generated=False) -> bool:
+    if not _job_dir_reachable(stdscr, job):
+        return False
+    job_dir = Path(job['path']) / job['name']
+    # Il restore usa una sola chiave per tutta la catena: una chiave diversa
+    # renderebbe irrecuperabili i restore point già cifrati
+    sample = bkcrypt.latest_encrypted_file(job_dir)
+    if sample:
+        ok, _ = bkcrypt.check_key(sample, passphrase=key)
+        if not ok:
+            show_message(stdscr, "Encryption key", [
+                "This job already has encrypted backups that this key does not open:",
+                f"  {sample.relative_to(job_dir)}",
+                "",
+                "A restore uses one key for the whole chain: changing the key",
+                "would make those restore points unrecoverable.",
+                "Key NOT saved."], C_ERR)
+            return False
+
+    path = bkcrypt.default_key_path(job)
+    if path.exists() and not confirm_dialog(stdscr, "Encryption key",
+                                            [f"Overwrite existing key file {path}?"]):
+        return False
+    try:
+        bkcrypt.write_key_file(path, key)
+    except OSError as e:
+        show_message(stdscr, "Encryption key", [f"Cannot write {path}: {e}"], C_ERR)
+        return False
+    job['encryption_key_file'] = str(path)
+    save_jobs(jobs)
+
+    lines = [f"Key saved to {path} (mode 600)."]
+    if generated:
+        lines += ["", "Generated key — shown only now, copy it outside the cluster:",
+                  "", f"  {key}"]
+    else:
+        lines += ["", "Keep a copy of the key outside the cluster."]
+    show_message(stdscr, "Encryption key", lines, C_OK)
+    return True
+
+
+def verify_job_key(stdscr, job):
+    if not _job_dir_reachable(stdscr, job):
+        return
+    key_file, passphrase = bkcrypt.key_file_for(job), None
+    if key_file is None:
+        passphrase = edit_text_dialog(stdscr, f"Encryption key — job {job['name']}",
+                                      "", secret=True)
+        if passphrase is None:
+            return
+    h, w = stdscr.getmaxyx()
+    try:
+        stdscr.addstr(h - 1, 0, " Verifying key...".ljust(w - 1)[:w - 1],
+                      curses.color_pair(C_STATUS))
+    except curses.error:
+        pass
+    stdscr.refresh()
+
+    job_dir = Path(job['path']) / job['name']
+    ok_n = plain_n = 0
+    bad = []
+    for f in bkcrypt.latest_files_per_image(job_dir):
+        if not bkcrypt.is_encrypted(f):
+            plain_n += 1
+            continue
+        ok, _ = bkcrypt.check_key(f, key_file=key_file, passphrase=passphrase)
+        if ok:
+            ok_n += 1
+        else:
+            bad.append(f"  {f.relative_to(job_dir)}")
+
+    lines = [f"Key: {'registered file ' + str(key_file) if key_file else 'entered manually'}",
+             "",
+             f"Latest file per image: {ok_n} OK, {len(bad)} NOT opened, "
+             f"{plain_n} not encrypted"]
+    if bad:
+        lines += ["", "Not opened:"] + bad[:10] + (["  ..."] if len(bad) > 10 else [])
+    if ok_n + len(bad) == 0:
+        lines += ["", "No encrypted backups yet."]
+    show_message(stdscr, "Verify key", lines, C_ERR if bad else C_OK)
+
+
+def screen_job_encryption(stdscr, config: dict, jobs: list, job_idx: int):
+    job = jobs[job_idx]
+    while True:
+        kf = job.get('encryption_key_file')
+        if bkcrypt.key_file_for(job):
+            key_status = f"registered ({kf})"
+        elif kf:
+            key_status = f"FILE MISSING ({kf})"
+        else:
+            key_status = "not set"
+        items = [
+            f"  Encryption: {'ON' if job.get('encrypt') else 'OFF'}   (Enter = toggle)",
+            f"  Key: {key_status}",
+            "  Set key (enter manually)",
+            "  Generate random key",
+            "  Verify key on latest backups",
+        ]
+        idx = scrollable_list(stdscr, title=f"Encryption — {job['name']}", items=items,
+                              hint="↑↓ navigate   Enter select   q back")
+        if idx is None:
+            return
+        if idx == 0:
+            if job.get('encrypt'):
+                if confirm_dialog(stdscr, "Encryption",
+                                  ["Disable encryption?",
+                                   "New backup files will be written in plaintext."]):
+                    job['encrypt'] = 0
+                    save_jobs(jobs)
+            elif bkcrypt.key_file_for(job) is None:
+                show_message(stdscr, "Encryption", ["Set or generate a key first."], C_ERR)
+            else:
+                job['encrypt'] = 1
+                save_jobs(jobs)
+                show_message(stdscr, "Encryption",
+                             ["Encryption enabled: from the next run new backup files",
+                              "are written encrypted (.gpg). Existing files are unchanged."],
+                             C_OK)
+        elif idx in (1, 2):
+            key = ask_new_key(stdscr)
+            if key:
+                save_job_key(stdscr, jobs, job, key)
+        elif idx == 3:
+            save_job_key(stdscr, jobs, job, bkcrypt.generate_key(), generated=True)
+        elif idx == 4:
+            verify_job_key(stdscr, job)
+
+
 def screen_job_menu(stdscr, config: dict, jobs: list, job_idx: int):
     job   = jobs[job_idx]
-    ITEMS = ["  Edit", "  VM management"]
+    ITEMS = ["  Edit", "  VM management", "  Encryption"]
     while True:
         idx = scrollable_list(
             stdscr,
@@ -1388,6 +1607,8 @@ def screen_job_menu(stdscr, config: dict, jobs: list, job_idx: int):
             screen_job_edit(stdscr, config, jobs, job_idx)
         elif idx == 1:
             screen_vm_list_for_job(stdscr, config, job)
+        elif idx == 2:
+            screen_job_encryption(stdscr, config, jobs, job_idx)
 
 
 # ── Schermata: lista backup job ───────────────────────────────────────────────
