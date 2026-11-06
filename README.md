@@ -29,6 +29,7 @@ Every scheduled action proiduces a detailed email reporting relevant data:
 | `bkrest.py` | Performs restore (`./bkrest.py <JOB> <IMAGE> <RESTPOINT> <DEST-IMAGE-NAME>`) |
 | `bkretention.py` | Applies retention by deleting old backups (cron daily) |
 | `bktrimsnap.py` | Deletes obsolete CEPH snapshots (cron daily) |
+| `bkwatchdog.py` | Emails an alert when an enabled job has not completed for more than `alert_hours` (default 26) — catches hung runs (cron daily, after the backup window) |
 | `cephbackup_ui.py` | Interactive curses UI for restore management |
 | `config.ini` | CEPH pool, libvirt path, email settings |
 | `backupjobs.json` | Backup job definitions |
@@ -124,6 +125,7 @@ lastbk.txt           ← timestamp of last completed backup
    ```
    0 2 * * *  /path/bkexec.py
    0 4 * * *  /path/bktrimsnap.py
+   0 8 * * *  /path/bkwatchdog.py
    ```
 7. On the target: copy `TARGETSIDE/` and cron `bklock.py` and `bkretention.py`
 
