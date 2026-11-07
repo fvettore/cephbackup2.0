@@ -1085,6 +1085,7 @@ JOB_FIELDS = [
     ("max_inc",     "Max incrementals",    "int"),
     ("snap-prefix", "Snapshot prefix",     "str"),
     ("max-snaps",   "Max snapshots",       "int"),
+    ("parallel",    "Parallel images (1-5)", "int"),
     ("encrypt",     "Encryption",          "bool"),
     ("encryption_key_file", "Encryption key file", "str"),
     ("_days",       "Scheduled days",      "days"),
@@ -1103,6 +1104,8 @@ def job_field_display(job: dict, ftype: str, fkey: str) -> str:
         weeks = job.get("schedule", {}).get("weeks", [])
         return "  ".join(str(w) for w in sorted(weeks)) or "(none)"
     val = job.get(fkey)
+    if fkey == "parallel" and val is None:
+        return "1"
     if ftype == "bool":
         return "YES" if val else "NO"
     if ftype == "strlist":
@@ -1188,7 +1191,17 @@ def screen_job_edit(stdscr, config: dict, jobs: list, job_idx: int):
                 current = str(job.get(fkey, ""))
                 new_val = edit_text_dialog(stdscr, flabel, current)
                 if new_val is not None:
-                    job[fkey] = int(new_val) if ftype == "int" else new_val
+                    if ftype == "int":
+                        try:
+                            val = int(new_val)
+                        except ValueError:
+                            val = None          # input non numerico: valore invariato
+                        if val is not None:
+                            if fkey == "parallel":
+                                val = min(max(val, 1), 5)
+                            job[fkey] = val
+                    else:
+                        job[fkey] = new_val
 
             elif ftype == "strlist":
                 current = ", ".join(job.get(fkey, []))

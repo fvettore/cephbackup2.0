@@ -68,6 +68,7 @@ rcpt_to    = admin@example.com
     "max_inc":     5,
     "snap-prefix": "BK",
     "max-snaps":   10,
+    "parallel":    1,
     "checkmount":  true,
     "mountpoint":  "/mnt/backup",
     "schedule": {
@@ -94,7 +95,13 @@ rcpt_to    = admin@example.com
    - Runs `rbd export-diff` to the destination directory
    - On failure (non-zero return code or 0-byte file) → removes the file and snapshot
    - On success → copies the VM XML definition to `VMDEF/<indir>/<incset>/`
-5. Sends an HTML email report with timing, speed, size and type for each image
+5. Sends an HTML email report with timing, speed, size and type for each image, plus a **TOTAL** row: total size, job duration (start to end, wall clock) and average speed (total size / job duration)
+
+### Parallel images
+
+`"parallel": N` (1–5, default 1) backs up up to N disk images of the same job at the same time (snapshot + `export-diff` [+ `gpg`] per image). Useful when a single stream does not saturate the link or the target. With N > 1 every log line of an image is prefixed with `[VM/image]`; the report keeps the VM order. Writes to the shared files of a VM (`vmbackup.json`, `VMDEF/`) are serialized, so multi-disk VMs are safe.
+
+Note: one NFS mount normally uses a single TCP connection, so with a bond (LACP) all streams go over one link. Mount with `nconnect=N` (Linux ≥ 5.3) to open several connections; an `active-backup` bond uses one link anyway.
 
 ## Backup directory structure
 
