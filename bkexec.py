@@ -23,6 +23,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import bkcrypt
+import bkstate
 
 SCRIPT_DIR = Path(__file__).parent
 MAX_PARALLEL = 5      # immagini elaborate in contemporanea per job (campo "parallel")
@@ -453,6 +454,19 @@ def backup_image(ctx: dict, vm_dir: Path, vm_name: str, vm_image: str, lg) -> di
                         bk_error = f"WARNING: VM definition not found at {xml_src}"
                         lg(bk_error)
 
+                    # NVRAM UEFI e stato TPM (percorsi letti dall'XML della VM)
+                    if ctx["save_state"] and xml_src.exists():
+                        try:
+                            xml_text = xml_src.read_text()
+                        except OSError as e:
+                            xml_text = None
+                            lg(f"WARNING: cannot read {xml_src} for NVRAM/TPM: {e}")
+                        if xml_text:
+                            st_warn = bkstate.save_state(xml_text, vm_name, vmdef_dir,
+                                                         key_file=key_file, lg=lg)
+                            if st_warn:
+                                bk_error = "; ".join(filter(None, [bk_error] + st_warn))
+
         # Riga di log per questa immagine
         lg(f"LOG | job={job_name} vm={vm_name} image={vm_image} "
            f"type={actual_type} result={res_str} "
@@ -477,6 +491,7 @@ def main():
     cfg          = load_config()
     pool         = cfg["ceph"]["poolname"]
     vm_cfg_path  = cfg["libvirt"]["vm_config_path"]
+    state_cfg    = bkstate.load_state_config(cfg)
 
     jobs = load_jobs()
 
@@ -588,6 +603,7 @@ def main():
             "timeout_snap":   job.get("timeout_snap",   120),
             "timeout_export": job.get("timeout_export", 7200),
             "vm_locks":       {},
+            "save_state":     state_cfg["backup"],
         }
 
         # Fase 1 (sequenziale): VM abilitate e loro immagini

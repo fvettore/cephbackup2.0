@@ -30,6 +30,7 @@ Every scheduled action proiduces a detailed email reporting relevant data:
 | `bkretention.py` | Applies retention by deleting old backups (cron daily) |
 | `bktrimsnap.py` | Deletes obsolete CEPH snapshots (cron daily) |
 | `bkcrypt.py` | Optional backup encryption helpers (gpg), used by the other scripts |
+| `bkstate.py` | Backup/restore of UEFI NVRAM and vTPM state of the VMs (paths read from the VM XML) |
 | `bkcheckkey.py` | Verifies that an encryption key opens the backups of a job (`./bkcheckkey.py JOB [VM] [--full] [--ask]`) |
 | `bkwatchdog.py` | Emails an alert when an enabled job has not completed for more than `alert_hours` (default 26) — catches hung runs (cron daily, after the backup window) |
 | `cephbackup_ui.py` | Interactive curses UI for restore management |
@@ -56,6 +57,15 @@ vm_config_path = /etc/libvirt/qemu
 [email]
 email_from = backup@example.com
 rcpt_to    = admin@example.com
+
+; optional section (comments on their own lines only)
+[vmstate]
+; 0 = do not save NVRAM/TPM
+backup            = 1
+; where the UI creates the NVRAM of restored VMs (empty = same dir as the original)
+nvram_restore_dir =
+; where the UI creates the TPM dirs of restored VMs (empty = same dir as the original)
+tpm_restore_dir   =
 ```
 
 **`backupjobs.json`**
@@ -101,7 +111,31 @@ rcpt_to    = admin@example.com
 
 `"parallel": N` (1–5, default 1) backs up up to N disk images of the same job at the same time (snapshot + `export-diff` [+ `gpg`] per image). Useful when a single stream does not saturate the link or the target. With N > 1 every log line of an image is prefixed with `[VM/image]`; the report keeps the VM order. Writes to the shared files of a VM (`vmbackup.json`, `VMDEF/`) are serialized, so multi-disk VMs are safe.
 
-Note: one NFS mount normally uses a single TCP connection, so with a bond (LACP) all streams go over one link. Mount with `nconnect=N` (Linux ≥ 5.3) to open several connections; an `active-backup` bond uses one link anyway.
+See [NFS target and `nconnect`](#nfs-target-and-nconnect) to let parallel streams use more than one TCP connection.
+
+### NFS target and `nconnect`
+
+By default an NFS mount uses **one TCP connection** to the server: all parallel streams share it, and with a bond they all hash to the same link. The `nconnect=N` mount option (Linux ≥ 5.3, N up to 16) opens N connections to the same server and spreads the traffic across them.
+
+`/etc/fstab` example:
+```
+nas01:/export/backup  /mnt/backup  nfs4  hard,_netdev,nofail,nconnect=2  0 0
+```
+
+Apply it with a full unmount/mount; `mount -o remount` does **not** change `nconnect`. Do it outside the backup window:
+```bash
+systemctl daemon-reload
+umount /mnt/backup && mount /mnt/backup
+grep /mnt/backup /proc/mounts        # must show nconnect=2
+ss -tn dst <nas-ip>:2049             # one ESTAB line per connection
+```
+
+Notes:
+- `nconnect` is per client–server pair: if several exports of the same server are mounted, the first mount sets it for all of them. Put the same value on every line for that server and unmount them all before remounting
+- It only helps if there are several streams: set `parallel` > 1 in the job (e.g. `parallel` = `nconnect`)
+- Bond mode matters: with `802.3ad` (LACP) and `xmit_hash_policy=layer3+4` different connections can use different links; with `active-backup` only one link is active, so `nconnect` helps only when the single connection (not the link) is the bottleneck
+- Larger `rsize`/`wsize` (e.g. `1048576`) usually help with big sequential writes; check the value actually negotiated in `/proc/mounts`
+- Compare the **TOTAL** row of the email report (speed = total size / job duration) before and after the change, using runs of the same type (incremental vs incremental)
 
 ## Backup directory structure
 
@@ -138,6 +172,26 @@ lastbk.txt           ← timestamp of last completed backup
    ```
 7. On the target: copy `TARGETSIDE/` and cron `bklock.py` and `bkretention.py`
 
+## UEFI NVRAM and vTPM state
+
+VMs with UEFI/Secure Boot and a virtual TPM keep state outside the disks: the NVRAM file (`<os><nvram>`) and the swtpm directory (`<tpm><backend type='emulator'><source type='dir' path=.../>`). Without them a full restore loses boot entries and updated Secure Boot keys, and BitLocker asks for the recovery key.
+
+After each successful disk backup `bkexec.py` saves them next to the XML:
+```
+VMDEF/<set>/<point>/<vm>.xml
+VMDEF/<set>/<point>/<vm>_VARS.fd            NVRAM (plain)
+VMDEF/<set>/<point>/TPM/tpm2-00.permall     TPM state (.gpg when the job is encrypted)
+```
+- Paths are always read from the VM XML; VMs without `<nvram>`/`<tpm>` are skipped
+- Files are read while the VM runs: two identical reads with unchanged mtime are required
+- A problem with NVRAM/TPM is a WARNING in the report, never a failed disk backup
+- `bklist.py` and the UI show an `NT` column (`N` = NVRAM, `T` = TPM, `-` = missing)
+
+Restore:
+- **UI**: NVRAM and TPM of the restore point are copied to **new** files (`<vm>_rest-YYYYMMDD_VARS.fd`, `<vm>_rest-YYYYMMDD/`) and the restored XML points to them — never to the production VM files (its swtpm holds a lock on the TPM directory). Owner/mode: `qemu:qemu 600` for the NVRAM, `tss:tss 700/600` for the TPM. If the restore point has no state, libvirt creates a new NVRAM from the template and swtpm a new empty TPM
+- **`bkrest.py ... --state`** also restores NVRAM/TPM onto the **original** VM, **`bkrest.py JOB VM RESTPOINT --state-only`** restores only them. The VM must be shut off (checked with Pacemaker `crm_resource --locate` for resource `VM_<name>`, then `virsh domstate`); current files are renamed `.bak-<date>`
+- Restoring only an old disk of a UEFI VM: if Windows updated the Secure Boot revocation list (DBX) since then, the old boot manager may not start with the current NVRAM — restore the NVRAM of the same point too
+
 ## Listing restore points
 
 ```bash
@@ -150,7 +204,8 @@ lastbk.txt           ← timestamp of last completed backup
 
 **Command line:**
 ```bash
-./bkrest.py JOB IMAGE RESTPOINT DEST-IMAGE-NAME
+./bkrest.py JOB IMAGE RESTPOINT DEST-IMAGE-NAME [--state]
+./bkrest.py JOB VM RESTPOINT --state-only
 ```
 
 **Interactive UI:**

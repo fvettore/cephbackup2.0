@@ -3,15 +3,21 @@
 bkrest.py — ripristina un'immagine disco da un restore point.
 Versione databaseless di bkrest.php.
 
-USAGE: ./bkrest.py <JOB> <IMAGE> <RESTPOINT> <RESTORED-NAME>
+USAGE: ./bkrest.py <JOB> <IMAGE> <RESTPOINT> <RESTORED-NAME> [--state]
+       ./bkrest.py <JOB> <VM> <RESTPOINT> --state-only
 
   JOB          nome del job (da backupjobs.json)
   IMAGE        nome dell'immagine CEPH (es. PANTHERA-sda)
   RESTPOINT    punto di ripristino nel formato 000001-000003
   RESTORED-NAME nome della nuova immagine CEPH da creare
+  --state      ripristina anche NVRAM UEFI e stato TPM del restore point sulla VM
+               originale (percorsi letti dal suo XML in vm_config_path).
+               La VM deve essere spenta; i file attuali sono rinominati .bak-<data>
+  --state-only solo NVRAM/TPM, senza dischi (secondo argomento = nome della VM)
 
 Esempio:
   ./bkrest.py NAS11day_01 PANTHERA-sda 000001-000003 PANTHERA-sda_rest
+  ./bkrest.py JOBNAME MYVM 000002-000004 --state-only
 
 © 2025 — GPLv3
 """
@@ -25,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 
 import bkcrypt
+import bkstate
 
 SCRIPT_DIR = Path(__file__).parent
 RESTORE_LOG_DIR = SCRIPT_DIR / "RESTORELOGS"
@@ -85,14 +92,24 @@ def run(cmd):
     return result.returncode
 
 
-def resolve_key(job, enc_files):
+def resolve_key(job, enc_files, tpm_file=None):
     """
     Chiave per i file cifrati: quella registrata nel job se valida,
     altrimenti richiesta all'utente (3 tentativi). Restituisce (key_file, passphrase).
+    tpm_file: verifica su uno stato TPM cifrato invece che su un diff rbd.
     """
+    def check(key_file=None, passphrase=None):
+        if not tpm_file:
+            return bkcrypt.check_key(enc_files[0], key_file=key_file, passphrase=passphrase)
+        try:
+            bkcrypt.decrypt_bytes(tpm_file, key_file, passphrase)
+            return True, "key OK"
+        except OSError as e:
+            return False, str(e)
+
     key_file = bkcrypt.key_file_for(job)
     if key_file:
-        ok, msg = bkcrypt.check_key(enc_files[0], key_file=key_file)
+        ok, msg = check(key_file=key_file)
         if ok:
             lg(f"Encryption key: file registrato nel job ({key_file}) — valida")
             return key_file, None
@@ -105,7 +122,7 @@ def resolve_key(job, enc_files):
         sys.exit(1)
     for attempt in range(1, 4):
         passphrase = getpass.getpass(f"Chiave di cifratura per il job {job['name']}: ")
-        ok, msg = bkcrypt.check_key(enc_files[0], passphrase=passphrase)
+        ok, msg = check(passphrase=passphrase)
         if ok:
             lg("Encryption key: inserita manualmente — valida")
             return None, passphrase
@@ -114,15 +131,47 @@ def resolve_key(job, enc_files):
     sys.exit(1)
 
 
-def main():
-    if len(sys.argv) < 5:
-        print(f"USAGE: {sys.argv[0]} JOB IMAGE RESTPOINT RESTORED-NAME")
+def restore_state(cfg, job, job_dir, vm_name, instance, incset, key_file, passphrase):
+    """NVRAM/TPM del restore point sulla VM originale (spenta)."""
+    vm_cfg   = Path(cfg["libvirt"]["vm_config_path"])
+    xml_path = vm_cfg / f"{vm_name}.xml"
+    lg()
+    lg(f"NVRAM / TPM della VM {vm_name} (restore point {instance}-{incset})")
+    if not xml_path.exists():
+        lg(f"ERROR: XML della VM non trovato: {xml_path}")
+        sys.exit(1)
+    nvram_dst, tpm_dst = bkstate.state_paths(xml_path.read_text())
+    if not nvram_dst and not tpm_dst:
+        lg("La VM non usa NVRAM UEFI né TPM: niente da ripristinare")
+        return
+    running, where = bkstate.vm_running(vm_name)
+    if running is not False:
+        lg(f"ERROR: la VM deve essere spenta ({where})")
+        sys.exit(1)
+    lg(f"VM spenta: {where}")
+    st = bkstate.point_state(job_dir / vm_name / "VMDEF" / instance / incset, vm_name)
+    if st["tpm_encrypted"] and not (key_file or passphrase):
+        key_file, passphrase = resolve_key(job, [], tpm_file=st["tpm"][0])
+    try:
+        bkstate.install_state(st, nvram_dst, tpm_dst, key_file, passphrase, lg=lg)
+    except OSError as e:
+        lg(f"ERROR: ripristino NVRAM/TPM fallito: {e}")
         sys.exit(1)
 
-    job_name      = sys.argv[1]
-    vm_image      = sys.argv[2]
-    restore_point = sys.argv[3]
-    restored_name = sys.argv[4]
+
+def main():
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    args  = [a for a in sys.argv[1:] if not a.startswith("--")]
+    state_only = "--state-only" in flags
+    with_state = "--state" in flags or state_only
+    if len(args) < (3 if state_only else 4):
+        print(__doc__)
+        sys.exit(1)
+
+    job_name      = args[0]
+    vm_image      = args[1]
+    restore_point = args[2]
+    restored_name = f"{vm_image}-state" if state_only else args[3]
 
     global LOG_FILE
     LOG_FILE = RESTORE_LOG_DIR / f"{STARTED:%Y%m%d_%H%M%S}_{restored_name}.log"
@@ -146,6 +195,14 @@ def main():
         sys.exit(1)
 
     job_dir = Path(job["path"]) / job_name
+
+    if state_only:
+        if not (job_dir / vm_image).is_dir():
+            lg(f"ERROR: VM '{vm_image}' non trovata nel job '{job_name}'")
+            sys.exit(1)
+        restore_state(cfg, job, job_dir, vm_image, instance, parts[1], None, None)
+        lg(f"Log: {LOG_FILE}")
+        return
 
     # Trova la VM che contiene l'immagine
     vm_name = find_vm_for_image(job_dir, vm_image)
@@ -180,6 +237,13 @@ def main():
         key_file, passphrase = resolve_key(job, enc_files)
         lg()
 
+    if with_state:
+        # controllo prima di creare l'immagine: con la VM accesa NVRAM/TPM non si toccano
+        running, where = bkstate.vm_running(vm_name)
+        if running is not False:
+            lg(f"ERROR: --state richiede la VM {vm_name} spenta ({where})")
+            sys.exit(1)
+
     # Crea immagine RBD vuota di destinazione
     lg(f"Creating empty image {restored_name} ...")
     rc = run(["rbd", "create", restored_name, "--size", "1024", "-p", pool])
@@ -203,6 +267,23 @@ def main():
         if rc != 0:
             lg(f"ERROR: rbd import-diff fallito su {diff_file} (rc={rc})")
             sys.exit(1)
+
+    if with_state:
+        restore_state(cfg, job, job_dir, vm_name, instance, parts[1], key_file, passphrase)
+    else:
+        vmdef = job_dir / vm_name / "VMDEF" / instance / parts[1]
+        xml = vmdef / f"{vm_name}.xml"
+        try:
+            uses_nvram = xml.exists() and bkstate.state_paths(xml.read_text())[0]
+        except Exception:
+            uses_nvram = False
+        if uses_nvram:
+            lg()
+            lg("NOTA: la VM usa NVRAM UEFI e qui è stato ripristinato solo il disco. Se Windows ha")
+            lg("aggiornato la lista di revoca Secure Boot (DBX) dopo questo restore point, il boot")
+            lg("manager vecchio potrebbe non avviarsi con l'NVRAM attuale: ripristinare anche")
+            lg("l'NVRAM di questo punto (--state / --state-only) oppure rinominare l'NVRAM")
+            lg("attuale perché libvirt lo ricrei dal template.")
 
     elapsed = int((datetime.now() - STARTED).total_seconds())
     lg()

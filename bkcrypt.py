@@ -203,3 +203,22 @@ def import_encrypted(path, rbd_target, key_file=None, passphrase=None, runner=No
     if gpg.returncode != 0:
         errlines = errlines + [_last_line(gpg_err, f"gpg exit code {gpg.returncode}")]
     return rc or gpg.returncode, errlines
+
+
+def encrypt_bytes(data: bytes, out_path, key_file):
+    """Cifra data (file piccoli: NVRAM/TPM) in out_path con la chiave del job."""
+    gpg_cmd = GPG_BASE + ["--passphrase-file", str(key_file), "--symmetric",
+                          "--cipher-algo", "AES256", "-o", str(out_path)]
+    r = subprocess.run(gpg_cmd, input=data, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=60)
+    if r.returncode != 0:
+        raise OSError(f"gpg encrypt failed: {_last_line(r.stderr, f'exit code {r.returncode}')}")
+
+
+def decrypt_bytes(path, key_file=None, passphrase=None) -> bytes:
+    """Decifra un file piccolo e ne restituisce il contenuto; OSError se la chiave non va."""
+    proc = decrypt_popen(path, subprocess.PIPE, key_file, passphrase)
+    data, err = proc.communicate(timeout=60)
+    if proc.returncode != 0:
+        raise OSError(f"gpg decrypt failed for {path}: {_last_line(err, f'exit code {proc.returncode}')}")
+    return data

@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 import bkcrypt
+import bkstate
 
 SCRIPT_DIR = Path(__file__).parent
 
@@ -67,8 +68,8 @@ def list_restore_points(vm_name, jobs):
                 continue
 
             print(f"\nVM: {vm_name}  image: {image_dir.name}  job: {job_name}")
-            print(f"{'DATE':<20} {'TYPE':<6} {'RESTPOINT':<14} {'SIZE':>11}  {'BACKUP-JOB'}")
-            print("-" * 70)
+            print(f"{'DATE':<20} {'TYPE':<6} {'RESTPOINT':<14} {'SIZE':>11}  {'NT':<2}  {'BACKUP-JOB'}")
+            print("-" * 74)
 
             for full_dir in full_dirs:
                 indir = full_dir.name
@@ -86,12 +87,15 @@ def list_restore_points(vm_name, jobs):
                     fdate   = mtime.strftime("%d-%m-%Y %H:%M:%S")
                     size    = entry.stat().st_size
                     restpoint = f"{indir}-{incset}"
-                    print(f"{fdate}  {bktype}  {restpoint}  {fmt_size(size)}  {job_name}")
+                    flags = bkstate.state_flags(vm_dir / "VMDEF" / indir / incset, vm_name)
+                    print(f"{fdate}  {bktype}  {restpoint}  {fmt_size(size)}  {flags}  {job_name}")
 
             found_any = True
 
     if not found_any:
         print(f"Nessun restore point trovato per la VM '{vm_name}'")
+    else:
+        print("\n* = cifrato   NT = N: NVRAM UEFI salvato, T: stato TPM salvato (- = assente)")
 
 
 def main():

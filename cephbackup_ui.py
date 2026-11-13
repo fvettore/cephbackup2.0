@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 import bkcrypt
+import bkstate
 from bkexec import is_mounted
 
 SCRIPT_DIR = Path(__file__).parent
@@ -59,6 +60,7 @@ def load_config() -> dict:
     return {
         'poolname':       cfg.get('ceph',    'poolname',       fallback='rbdpool01'),
         'vm_config_path': cfg.get('libvirt', 'vm_config_path', fallback='/etc/libvirt/qemu'),
+        'vmstate':        bkstate.load_state_config(cfg),
     }
 
 
@@ -131,7 +133,9 @@ def fetch_restore_points(jobs: list, vm_name: str) -> list:
                         size_str = f"{size / 1_000_000:>7.2f} MB"
                     else:
                         size_str = f"{size:>10}  B"
+                    vmdef_dir = vm_dir / "VMDEF" / indir / incset
                     points.append({
+                        'state':     bkstate.state_flags(vmdef_dir, vm_name),
                         'date':      mtime.strftime('%d-%m-%Y %H:%M'),
                         'type':      bktype,
                         'restpoint': f"{indir}-{incset}",
@@ -156,6 +160,11 @@ def fetch_images_for_vm_job(jobs: list, vm_name: str, job_name: str) -> list:
             if d.is_dir() and d.name not in SKIP_DIRS
         )
     return []
+
+
+def point_vmdef_dir(point: dict, vm_name: str) -> Path:
+    indir, incset = point['restpoint'].split('-')
+    return Path(point['job_path']) / point['job'] / vm_name / "VMDEF" / indir / incset
 
 
 def vmdef_exists(point: dict, vm_name: str) -> bool:
@@ -369,6 +378,38 @@ def do_restore(config, vm_name, point, images, log, log_progress,
     xml_dest = TMP_DIR / f"{vm_name}_rest-{date_suffix}.xml"
     xml_content = xml_src.read_text()
     xml_content = patch_xml(xml_content, vm_name, date_suffix, restored_images)
+
+    # ── NVRAM / TPM: mai i file della VM di produzione ─────────────────────────
+    try:
+        orig_nvram, orig_tpm = bkstate.state_paths(xml_src.read_text())
+    except Exception as e:
+        orig_nvram = orig_tpm = None
+        log(f"WARNING: cannot read NVRAM/TPM paths from XML: {e}", C_ERR)
+    if orig_nvram or orig_tpm:
+        vm_rest_name = f"{vm_name}_rest-{date_suffix}"
+        nvram_dst, tpm_dst = bkstate.restore_targets(
+            orig_nvram, orig_tpm, vm_rest_name, config.get('vmstate', {}))
+        vmdef_dir = Path(job_path) / job_name / vm_name / "VMDEF" / indir / incset
+        st = bkstate.point_state(vmdef_dir, vm_name)
+        log("─" * 60)
+        log("NVRAM / TPM of the restore point:", C_HEADER)
+        try:
+            bkstate.install_state(st, nvram_dst, tpm_dst, key_file, passphrase,
+                                  lg=lambda m: log(m))
+        except Exception as e:
+            log(f"ERROR: NVRAM/TPM restore failed: {e}", C_ERR)
+            return {
+                'restored_images': restored_images,
+                'xml_dest':        None,
+                'virsh_ok':        False,
+                'error':           f"NVRAM/TPM restore failed: {e}",
+            }
+        xml_content = bkstate.patch_state_paths(xml_content, nvram_dst, tpm_dst)
+        if nvram_dst:
+            log(f"  XML <nvram> → {nvram_dst}", C_DIM)
+        if tpm_dst:
+            log(f"  XML <tpm> source → {tpm_dst}", C_DIM)
+
     xml_dest.write_text(xml_content)
     log(f"Patched XML saved to {xml_dest}", C_OK)
 
@@ -794,13 +835,24 @@ def restore_key_dialog(stdscr, jobs, vm_name, point, images):
                                  str(x).zfill(6))
              for img in images for x in range(int(incset) + 1)]
     enc = [f for f in files if f.is_file() and bkcrypt.is_encrypted(f)]
-    if not enc:
+    tpm_enc = [f for f in bkstate.point_state(point_vmdef_dir(point, vm_name), vm_name)['tpm']
+               if f.name.endswith(bkcrypt.ENC_SUFFIX)]
+    if not enc and not tpm_enc:
         return {}
+
+    def check(key_file=None, passphrase=None):
+        if enc:
+            return bkcrypt.check_key(enc[0], key_file=key_file, passphrase=passphrase)
+        try:                                    # solo lo stato TPM è cifrato
+            bkcrypt.decrypt_bytes(tpm_enc[0], key_file, passphrase)
+            return True, "key OK"
+        except OSError as e:
+            return False, str(e)
 
     job      = next((j for j in jobs if j['name'] == point['job']), {})
     key_file = bkcrypt.key_file_for(job)
     if key_file:
-        ok, msg = bkcrypt.check_key(enc[0], key_file=key_file)
+        ok, msg = check(key_file=key_file)
         if ok:
             return {'key_file': key_file, 'encrypted': True}
         show_message(stdscr, "Encryption key",
@@ -812,7 +864,7 @@ def restore_key_dialog(stdscr, jobs, vm_name, point, images):
                                       "", secret=True)
         if passphrase is None:
             return None
-        ok, msg = bkcrypt.check_key(enc[0], passphrase=passphrase)
+        ok, msg = check(passphrase=passphrase)
         if ok:
             return {'passphrase': passphrase, 'encrypted': True}
         show_message(stdscr, "Encryption key",
@@ -843,11 +895,11 @@ def screen_restore_points(stdscr, config, jobs, vm_name):
     col_img  = 20
     header = (f"{'DATE':<{col_date}}  {'TYPE':<{col_type}}  "
               f"{'RESTORE POINT':<{col_rp}}  {'SIZE':>{col_size}}  "
-              f"{'IMAGE':<{col_img}}  JOB")
+              f"{'IMAGE':<{col_img}}  {'NT':<2}  JOB")
     labels = [
         (f"{p['date']:<{col_date}}  {p['type']:<{col_type}}  "
          f"{p['restpoint']:<{col_rp}}  {p['size']:>{col_size}}  "
-         f"{p['image']:<{col_img}}  {p['job']}")
+         f"{p['image']:<{col_img}}  {p['state']:<2}  {p['job']}")
         for p in points
     ]
 
@@ -857,7 +909,7 @@ def screen_restore_points(stdscr, config, jobs, vm_name):
             title=f"Restore point — {vm_name}",
             items=labels,
             header=header,
-            hint="↑↓ navigate   Enter restore   q back   (* = encrypted)",
+            hint="↑↓ navigate   Enter restore   q back   * = encrypted   NT = NVRAM/TPM saved",
         )
         if idx is None:
             return
@@ -893,6 +945,22 @@ def screen_restore_points(stdscr, config, jobs, vm_name):
         ]
         if not has_vmdef:
             info_lines += ["", "WARNING: no XML found — virsh define will not be run."]
+        else:
+            st_flags = point['state']
+            xml_text = (point_vmdef_dir(point, vm_name) / f"{vm_name}.xml").read_text()
+            try:
+                uses_nvram, uses_tpm = (bool(x) for x in bkstate.state_paths(xml_text))
+            except Exception:
+                uses_nvram = uses_tpm = False
+            if uses_nvram or uses_tpm:
+                info_lines += ["", "NVRAM / TPM (copied to new files, production untouched):"]
+                if uses_nvram:
+                    info_lines.append("  NVRAM: from restore point" if st_flags[0] == "N" else
+                                      "  WARNING: no NVRAM in restore point — new one from template")
+                if uses_tpm:
+                    info_lines.append("  TPM:   from restore point" if st_flags[1] == "T" else
+                                      "  WARNING: no TPM state in restore point — new empty TPM "
+                                      "(BitLocker recovery key needed)")
 
         if confirm_dialog(stdscr, "Confirm restore", info_lines):
             key = restore_key_dialog(stdscr, jobs, vm_name, point, images)
