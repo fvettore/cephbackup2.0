@@ -1,0 +1,10 @@
+# Rotazione del log SIEM di cephbackup (bksiem.py).
+# Installazione: cp contrib/logrotate-cephbackup /etc/logrotate.d/cephbackup
+# Niente copytruncate: bksiem.py apre il file in append a ogni riga.
+/var/log/cephbackup/siem.log {
+    weekly
+    rotate 8
+    create 0640 root root
+    missingok
+    notifempty
+}

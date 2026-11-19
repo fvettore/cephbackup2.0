@@ -31,17 +31,23 @@ from datetime import datetime
 from pathlib import Path
 
 import bkcrypt
+import bksiem
 import bkstate
 
 SCRIPT_DIR = Path(__file__).parent
 RESTORE_LOG_DIR = SCRIPT_DIR / "RESTORELOGS"
 STARTED  = datetime.now()
 LOG_FILE = None
+SIEM     = {}       # campi di restore_start, per restore_end
+LAST_ERROR = ""
 
 
 def lg(msg=""):
     """Stampa a video e scrive su RESTORELOGS con data/ora."""
+    global LAST_ERROR
     print(msg)
+    if str(msg).startswith("ERROR"):
+        LAST_ERROR = str(msg)
     if LOG_FILE is None:
         return
     try:
@@ -131,6 +137,23 @@ def resolve_key(job, enc_files, tpm_file=None):
     sys.exit(1)
 
 
+def siem_start(job_name, vm, image, restpoint, dest):
+    SIEM.update(job=job_name, vm=vm, image=image, restpoint=restpoint, dest=dest,
+                user=bksiem.current_user())
+    bksiem.emit("restore_start", job_name, **{k: v for k, v in SIEM.items() if k != "job"})
+
+
+def siem_end(result, error=""):
+    if not SIEM or SIEM.get("ended"):
+        return
+    SIEM["ended"] = True
+    fields = {k: v for k, v in SIEM.items() if k not in ("job", "ended")}
+    fields["result"] = result
+    if error:
+        fields["error"] = error
+    bksiem.emit("restore_end", SIEM["job"], **fields)
+
+
 def restore_state(cfg, job, job_dir, vm_name, instance, incset, key_file, passphrase):
     """NVRAM/TPM del restore point sulla VM originale (spenta)."""
     vm_cfg   = Path(cfg["libvirt"]["vm_config_path"])
@@ -200,7 +223,9 @@ def main():
         if not (job_dir / vm_image).is_dir():
             lg(f"ERROR: VM '{vm_image}' non trovata nel job '{job_name}'")
             sys.exit(1)
+        siem_start(job_name, vm_image, "-", restore_point, "state")
         restore_state(cfg, job, job_dir, vm_image, instance, parts[1], None, None)
+        siem_end("OK")
         lg(f"Log: {LOG_FILE}")
         return
 
@@ -209,6 +234,10 @@ def main():
     if not vm_name:
         lg(f"ERROR: immagine '{vm_image}' non trovata nel job '{job_name}'")
         sys.exit(1)
+
+    # Da qui in poi ogni uscita con errore produce restore_end result=ERROR
+    siem_start(job_name, vm_name, vm_image, restore_point,
+               f"{pool}/{restored_name}" + ("+state" if with_state else ""))
 
     backup_path = job_dir / vm_name / vm_image / instance
     if not backup_path.is_dir():
@@ -285,6 +314,7 @@ def main():
             lg("l'NVRAM di questo punto (--state / --state-only) oppure rinominare l'NVRAM")
             lg("attuale perché libvirt lo ricrei dal template.")
 
+    siem_end("OK")
     elapsed = int((datetime.now() - STARTED).total_seconds())
     lg()
     lg(f"Restore completato: {pool}/{restored_name}")
@@ -293,4 +323,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (0, None):
+            siem_end("ERROR", LAST_ERROR or f"exit code {e.code}")
+        raise
+    except BaseException as e:
+        siem_end("ERROR", f"{type(e).__name__}: {e}")
+        raise

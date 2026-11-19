@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import bksiem
+
 SCRIPT_DIR = Path(__file__).parent
 SKIP_DIRS  = {"LOGS", "VMDEF"}
 
@@ -71,19 +73,23 @@ def list_snapshots(pool: str, image: str) -> list:
         return []
 
 
-def remove_snapshot(pool: str, image: str, snap_name: str) -> bool:
+def remove_snapshot(pool: str, image: str, snap_name: str, job: str = "", vm: str = "") -> bool:
     cmd = ["rbd", "snap", "rm", f"{pool}/{image}@{snap_name}"]
     print(f"  rbd snap rm {pool}/{image}@{snap_name}")
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         print(f"  ERROR: {r.stderr.strip()}", file=sys.stderr)
+        bksiem.emit("snap_remove", job, vm=vm, image=image, snap=snap_name,
+                    result="ERROR", error=r.stderr.strip() or f"rc={r.returncode}")
         return False
+    bksiem.emit("snap_remove", job, vm=vm, image=image, snap=snap_name, result="OK")
     return True
 
 
 # ── Trim logic ────────────────────────────────────────────────────────────────
 
-def trim_snapshots(pool: str, image: str, snap_prefix: str, max_snaps: int):
+def trim_snapshots(pool: str, image: str, snap_prefix: str, max_snaps: int,
+                   job: str = "", vm: str = ""):
     """
     Elenca gli snapshot dell'immagine, filtra quelli con il prefisso del job
     e rimuove i più vecchi mantenendo solo gli ultimi max_snaps.
@@ -100,7 +106,7 @@ def trim_snapshots(pool: str, image: str, snap_prefix: str, max_snaps: int):
         return
 
     for snap_name in bk_snaps[:to_remove]:
-        remove_snapshot(pool, image, snap_name)
+        remove_snapshot(pool, image, snap_name, job, vm)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -147,7 +153,7 @@ def main():
             print(f"\n  VM: {vm_name}")
             for image in images:
                 print(f"    image: {image}")
-                trim_snapshots(pool, image, snap_prefix, max_snaps)
+                trim_snapshots(pool, image, snap_prefix, max_snaps, job_name, vm_name)
 
 
 if __name__ == "__main__":

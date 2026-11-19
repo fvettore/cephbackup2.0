@@ -23,6 +23,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 import bkcrypt
+import bksiem
 import bkstate
 
 SCRIPT_DIR = Path(__file__).parent
@@ -523,10 +524,12 @@ def main():
 
         if days_ok and cur_day not in days_ok:
             print(f"[{job_name}] Skipping: not scheduled for day {cur_day}", flush=True)
+            bksiem.emit("job_skip", job_name, reason="schedule")
             continue
 
         if weeks_ok and cur_week not in weeks_ok:
             print(f"[{job_name}] Skipping: not scheduled for week {cur_week}", flush=True)
+            bksiem.emit("job_skip", job_name, reason="schedule")
             continue
 
         # ── mount check ────────────────────────────────────────────
@@ -538,6 +541,7 @@ def main():
             if not is_mounted(mp):
                 err = f"Mountpoint {mp} not mounted or not responding"
                 print(f"[{job_name}] {err}", flush=True)
+                bksiem.emit("job_abort", job_name, reason="mount", error=err)
                 send_email(job, f"[FAIL] CEPH Backup {job_name} (ALL objects)",
                            f"<h3>{err}</h3>")
                 continue
@@ -553,6 +557,7 @@ def main():
         if last_run and last_compl and last_run > last_compl:
             err = f"Same JOB already running from {last_run}"
             lg(err)
+            bksiem.emit("job_abort", job_name, reason="lock", error=err)
             send_email(job, f"[FAIL] CEPH Backup {job_name} (ALL objects)",
                        f"<h3>{err}</h3>")
             continue
@@ -566,6 +571,8 @@ def main():
                 err = (f"Encryption enabled but key file not found: "
                        f"{job.get('encryption_key_file')}")
                 lg(f"ERROR: {err}")
+                bksiem.emit("job_abort", job_name, reason="encryption",
+                            error="encryption enabled but key file not found")
                 send_email(job, f"[FAIL] CEPH Backup {job_name} (ALL objects)",
                            f"<h3>{err}</h3>")
                 continue
@@ -573,13 +580,18 @@ def main():
                 lg(f"WARNING: key file {key_file} is accessible by group/others (chmod 600)")
             lg(f"Encryption: ON (key file {key_file})")
 
+        # Prima di impostare lastrun: uscire dopo lascerebbe il lock attivo
+        if not job_dir.exists():
+            lg(f"ERROR: job directory not found: {job_dir}")
+            bksiem.emit("job_abort", job_name, reason="novm",
+                        error=f"job directory not found: {job_dir}")
+            send_email(job, f"[FAIL] CEPH Backup {job_name} (ALL objects)",
+                       f"<h3>Job directory not found: {job_dir}</h3>")
+            continue
+
         # ── backup starts ──────────────────────────────────────────
         job["lastrun"] = now_str()
         save_jobs(jobs)
-
-        if not job_dir.exists():
-            lg(f"ERROR: job directory not found: {job_dir}")
-            continue
 
         # Scopre VM scansionando la cartella del job
         SKIP_DIRS = {"LOGS"}
@@ -605,6 +617,8 @@ def main():
             "vm_locks":       {},
             "save_state":     state_cfg["backup"],
         }
+
+        bksiem.emit("job_start", job_name, parallel=parallel)
 
         # Fase 1 (sequenziale): VM abilitate e loro immagini
         tasks = []
@@ -649,7 +663,14 @@ def main():
             else:
                 tlg = lg
                 lg(f"\n--- {vm_name} / {vm_image} ---")
-            return backup_image(ctx, vm_dir, vm_name, vm_image, tlg)
+            r = backup_image(ctx, vm_dir, vm_name, vm_image, tlg)
+            ev = dict(vm=r["vm"], image=r["image"], type=r["type"], result=r["result"],
+                      start=bksiem.iso(r["start"]), end=bksiem.iso(r["end"]),
+                      size=r["size"], encrypted=int(bool(key_file)))
+            if r["result"] != "SUCCESS":
+                ev["error"] = r["error"]
+            bksiem.emit("image", job_name, **ev)
+            return r
 
         with ThreadPoolExecutor(max_workers=parallel) as ex:
             # map restituisce i risultati nell'ordine delle VM (report leggibile)
@@ -668,17 +689,26 @@ def main():
         if bk_results:
             report = "FAIL" if BACKUP_FAIL else "SUCCESS"
             totals = compute_totals(bk_results, job["lastrun"], job["lastcompletion"])
-            lg(f"\nTOTAL | images={len(bk_results)} ok={totals['ok']} fail={totals['fail']} "
+            lg(f"\nTOTAL | job={job_name} images={len(bk_results)} ok={totals['ok']} fail={totals['fail']} "
                f"size={totals['size']} ({fmt_size(totals['size'])}) "
                f"duration={totals['duration']} ({totals['secs']}s) "
                f"speed={fmt_speed(totals['size'], totals['secs'])} parallel={parallel}")
+            bksiem.emit("total", job_name, result=report, images=len(bk_results),
+                        ok=totals["ok"], fail=totals["fail"], size=totals["size"],
+                        secs=totals["secs"], parallel=parallel)
             html   = build_report_html(job_name, bk_results, BACKUP_FAIL, totals, parallel)
             send_email(job, f"[{report}] CEPH Backup {job_name} ({len(vm_dirs)} objects)", html)
         else:
+            bksiem.emit("job_abort", job_name, reason="novm",
+                        error="no VMs found or all skipped")
             send_email(job,
                        f"[FAIL] CEPH Backup {job_name} (ALL objects)",
                        "<h3>No VMs found or all skipped</h3>")
 
 
 if __name__ == "__main__":
+    if "--siem-test" in sys.argv:
+        bksiem.emit("test", "TEST", source="bkexec.py")
+        print(f"SIEM test line written to {bksiem.SIEM_LOG}")
+        sys.exit(0)
     main()

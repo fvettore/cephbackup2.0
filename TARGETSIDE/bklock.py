@@ -8,6 +8,7 @@ Da mettere in cron.
 © 2025 — GPLv3
 """
 
+import configparser
 import subprocess
 import sys
 from datetime import datetime
@@ -19,8 +20,37 @@ SKIP_FILES = {"vmbackup.json"}
 SKIP_DIRS  = {"VMDEF"}
 
 
-def chattr(flag: str, path: Path):
-    subprocess.run(["chattr", flag, str(path)], check=False)
+# ── SIEM: una riga di syslog (inoltrata dal NAS al SIEM come programma siem-*) ──
+
+def _siem_fmt(value) -> str:
+    s = " ".join(str(value).split())[:500]
+    if s == "" or any(c in s for c in ' "='):
+        return '"' + s.replace('"', "'") + '"'
+    return s
+
+
+def siem(event: str, job: str, **fields):
+    """logger -t siem-cephbackup; non deve mai far fallire lo script."""
+    line = " ".join([f"event={_siem_fmt(event)}", f"job={_siem_fmt(job)}"] +
+                    [f"{k}={_siem_fmt(v)}" for k, v in fields.items()])
+    try:
+        subprocess.run(["logger", "-t", "siem-cephbackup", "-p", "authpriv.notice", line],
+                       timeout=5, check=False)
+    except Exception:
+        pass
+
+
+def job_name() -> str:
+    cfg = configparser.ConfigParser()
+    cfg.read(SCRIPT_DIR / "config.ini")
+    return cfg.get("job", "jobname", fallback="") or SCRIPT_DIR.name
+
+
+def chattr(flag: str, path: Path) -> bool:
+    return subprocess.run(["chattr", flag, str(path)], check=False).returncode == 0
+
+
+STATS = {"files": 0, "errors": 0}
 
 
 def recurse_folder(path: Path):
@@ -37,7 +67,9 @@ def recurse_folder(path: Path):
                 print(f"skip immutable (excluded file): {entry}")
                 continue
             print(f"apply immutable flag to {entry}")
-            chattr("+i", entry)
+            STATS["files"] += 1
+            if not chattr("+i", entry):
+                STATS["errors"] += 1
 
 
 def main():
@@ -48,7 +80,15 @@ def main():
     locktime = lastlock_file.read_text().strip()  if lastlock_file.exists() else ""
 
     if bktime > locktime:
-        recurse_folder(SCRIPT_DIR)
+        try:
+            recurse_folder(SCRIPT_DIR)
+        except Exception as e:
+            siem("target_lock", job_name(), files=STATS["files"], result="ERROR",
+                 error=f"{type(e).__name__}: {e}")
+            raise
+        siem("target_lock", job_name(), files=STATS["files"],
+             result="ERROR" if STATS["errors"] else "OK",
+             **({"errors": STATS["errors"]} if STATS["errors"] else {}))
 
     # Rimuove flag immutable dai .txt prima di aggiornare lastlock.txt
     for txt in SCRIPT_DIR.glob("*.txt"):

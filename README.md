@@ -31,6 +31,7 @@ Every scheduled action proiduces a detailed email reporting relevant data:
 | `bktrimsnap.py` | Deletes obsolete CEPH snapshots (cron daily) |
 | `bkcrypt.py` | Optional backup encryption helpers (gpg), used by the other scripts |
 | `bkstate.py` | Backup/restore of UEFI NVRAM and vTPM state of the VMs (paths read from the VM XML) |
+| `bksiem.py` | Local log for a SIEM (`/var/log/cephbackup/siem.log`, one `key=value` line per event) |
 | `bkcheckkey.py` | Verifies that an encryption key opens the backups of a job (`./bkcheckkey.py JOB [VM] [--full] [--ask]`) |
 | `bkwatchdog.py` | Emails an alert when an enabled job has not completed for more than `alert_hours` (default 26) — catches hung runs (cron daily, after the backup window) |
 | `cephbackup_ui.py` | Interactive curses UI for restore management |
@@ -256,6 +257,22 @@ Verify a key against the backups of a job:
 ./bkcheckkey.py JOB --full        # decrypts every file of the latest set (integrity check, slow)
 ./bkcheckkey.py JOB --ask         # ask for the key even if one is registered (e.g. test the offline copy)
 ```
+
+## SIEM log
+
+Besides the email and the logs on the target, every script writes one line per event to a **local** file, meant to be collected by a log shipper (Fluent Bit, Filebeat, ...). It is never on NFS/CephFS, so a hung mount cannot block the collector:
+
+```
+/var/log/cephbackup/siem.log      (dir 0750, file 0640, rotated by contrib/logrotate-cephbackup)
+2026-11-19T21:37:38+01:00 cephbackup event=image job=JOB vm=VM image=IMG type=full result=SUCCESS start=... end=... size=3122690128 encrypted=0
+```
+
+- Events: `job_start`, `job_skip`, `job_abort` (`reason=mount|lock|encryption|novm`), `image`, `total`, `snap_remove`, `restore_start` / `restore_end` (with `user=`), `watchdog_alert`, `config_change` (UI edits of `backupjobs.json` and VM enable/disable)
+- Timestamps with timezone; values with spaces are double-quoted; max 500 characters per value; no secrets (no passphrases or key file paths)
+- Writing the line can never fail or slow down a backup: errors are ignored
+- Test: `./bkexec.py --siem-test` or `./bksiem.py --test`; the path can be changed with the `CEPHBACKUP_SIEM_LOG` environment variable
+- Install the rotation: `cp contrib/logrotate-cephbackup /etc/logrotate.d/cephbackup`
+- `TARGETSIDE/bklock.py` and `TARGETSIDE/bkretention.py` send `event=target_lock` / `event=target_retention_delete` to the target's syslog (`logger -t siem-cephbackup -p authpriv.notice`)
 
 ## Retention
 

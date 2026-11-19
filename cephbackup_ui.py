@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 import bkcrypt
+import bksiem
 import bkstate
 from bkexec import is_mounted
 
@@ -72,7 +73,44 @@ def load_jobs() -> list:
         return json.load(f)
 
 
+# Campi di backupjobs.json il cui valore non va nel log SIEM
+SIEM_REDACT = {"encryption_key_file"}
+
+
+def siem_config_changes(old_jobs: list, new_jobs: list):
+    """Un evento config_change per ogni campo cambiato rispetto al file su disco."""
+    user = bksiem.current_user()
+    old_by = {j.get("name"): j for j in old_jobs}
+    new_by = {j.get("name"): j for j in new_jobs}
+    for name in new_by.keys() - old_by.keys():
+        bksiem.emit("config_change", name, field="job", old="", new="created", user=user)
+    for name in old_by.keys() - new_by.keys():
+        bksiem.emit("config_change", name, field="job", old="exists", new="deleted", user=user)
+    for name in new_by.keys() & old_by.keys():
+        o, n = old_by[name], new_by[name]
+        for field in sorted(set(o) | set(n)):
+            if o.get(field) == n.get(field):
+                continue
+            ov, nv = o.get(field, ""), n.get(field, "")
+            if field in SIEM_REDACT:
+                ov, nv = ("set" if ov else ""), ("set" if nv else "")
+            if not isinstance(ov, str):
+                ov = json.dumps(ov, separators=(",", ":"))
+            if not isinstance(nv, str):
+                nv = json.dumps(nv, separators=(",", ":"))
+            bksiem.emit("config_change", name, field=field, old=ov, new=nv, user=user)
+
+
 def save_jobs(jobs: list):
+    try:
+        with open(SCRIPT_DIR / "backupjobs.json") as f:
+            old_jobs = json.load(f)
+    except (OSError, ValueError):
+        old_jobs = []
+    try:
+        siem_config_changes(old_jobs, jobs)
+    except Exception:
+        pass        # il log SIEM non deve mai bloccare il salvataggio
     tmp = SCRIPT_DIR / "backupjobs.json.tmp"
     tmp.write_text(json.dumps(jobs, indent=2, ensure_ascii=False))
     tmp.replace(SCRIPT_DIR / "backupjobs.json")
@@ -790,8 +828,20 @@ def screen_restore_run(stdscr, config, vm_name, point, images,
         log(f"Encryption:    {'key file ' + str(key_file) if key_file else 'key entered manually'}")
     log("─" * 60)
 
-    result = do_restore(config, vm_name, point, images, log, lv.log_progress,
-                        key_file=key_file, passphrase=passphrase)
+    siem = dict(vm=vm_name, image=",".join(images), restpoint=point['restpoint'],
+                dest=",".join(restored_names), user=bksiem.current_user())
+    bksiem.emit("restore_start", point['job'], **siem)
+    try:
+        result = do_restore(config, vm_name, point, images, log, lv.log_progress,
+                            key_file=key_file, passphrase=passphrase)
+    except Exception as e:
+        bksiem.emit("restore_end", point['job'], **siem, result="ERROR",
+                    error=f"{type(e).__name__}: {e}")
+        raise
+    if result.get('error'):
+        bksiem.emit("restore_end", point['job'], **siem, result="ERROR", error=result['error'])
+    else:
+        bksiem.emit("restore_end", point['job'], **siem, result="OK")
 
     elapsed = int((datetime.now() - started).total_seconds())
     log("─" * 60)
@@ -1385,6 +1435,8 @@ def screen_add_vm(stdscr, config: dict, job: dict):
             (vm_dir / "vmbackup.json").write_text(
                 json.dumps({"lastrun": None, "success": None, "enabled": 1}, indent=2)
             )
+            bksiem.emit("config_change", job['name'], vm=vm_name, field="vm_added",
+                        old="", new=1, user=bksiem.current_user())
             show_message(stdscr, "VM added",
                          [f"'{vm_name}' added to job '{job['name']}'.",
                           f"Directory: {vm_dir}"], C_OK)
@@ -1504,10 +1556,13 @@ def screen_vm_list_for_job(stdscr, config: dict, job: dict):
                 screen_add_vm(stdscr, config, job)
             else:
                 vmb = item['vmb']
-                vmb['enabled'] = 0 if vmb.get('enabled', 1) else 1
+                old_en = vmb.get('enabled', 1)
+                vmb['enabled'] = 0 if old_en else 1
                 item['vm_dir'].joinpath("vmbackup.json").write_text(
                     json.dumps(vmb, indent=2)
                 )
+                bksiem.emit("config_change", job['name'], vm=item['name'], field="vm_enabled",
+                            old=int(bool(old_en)), new=vmb['enabled'], user=bksiem.current_user())
         elif key in (ord('a'), ord('A')):
             screen_add_vm(stdscr, config, job)
         elif key in (ord('q'), ord('Q'), 27):

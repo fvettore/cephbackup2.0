@@ -16,6 +16,7 @@ import subprocess
 import sys
 from datetime import datetime
 
+import bksiem
 from bkexec import load_jobs, send_email
 
 DEFAULT_ALERT_HOURS = 26
@@ -80,6 +81,12 @@ def main():
 
         alerts += 1
         print(f"[{job['name']}] ALLARME: {problem}")
+        last_compl = parse_ts(job.get("lastcompletion"))
+        bksiem.emit("watchdog_alert", job["name"],
+                    hours=int((now - last_compl).total_seconds() // 3600) if last_compl else "",
+                    lastrun=bksiem.iso(job.get("lastrun")) if job.get("lastrun") else "",
+                    lastcompletion=bksiem.iso(job.get("lastcompletion")) if job.get("lastcompletion") else "",
+                    error=problem)
         html = (f"<h3>Job {job['name']}: {problem}</h3>"
                 f"<p>Processi bkexec.py in esecuzione: {proc_info}</p>"
                 f"<p>Verificare mount del target, log in "

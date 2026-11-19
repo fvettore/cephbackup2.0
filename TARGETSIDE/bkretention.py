@@ -20,6 +20,27 @@ from typing import Optional
 
 SCRIPT_DIR = Path(__file__).parent
 SKIP_DIRS  = {"VMDEF", "LOGS"}
+JOB_NAME   = ""     # impostato in main() da config.ini, per le righe SIEM
+
+
+# ── SIEM: una riga di syslog (inoltrata dal NAS al SIEM come programma siem-*) ──
+
+def _siem_fmt(value) -> str:
+    s = " ".join(str(value).split())[:500]
+    if s == "" or any(c in s for c in ' "='):
+        return '"' + s.replace('"', "'") + '"'
+    return s
+
+
+def siem(event: str, job: str, **fields):
+    """logger -t siem-cephbackup; non deve mai far fallire lo script."""
+    line = " ".join([f"event={_siem_fmt(event)}", f"job={_siem_fmt(job)}"] +
+                    [f"{k}={_siem_fmt(v)}" for k, v in fields.items()])
+    try:
+        subprocess.run(["logger", "-t", "siem-cephbackup", "-p", "authpriv.notice", line],
+                       timeout=5, check=False)
+    except Exception:
+        pass
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -129,6 +150,13 @@ def purge_backupset(bkset_dir: Path) -> str:
     return "SUCCESS"
 
 
+def purge_and_log(bkset_dir: Path) -> str:
+    result = purge_backupset(bkset_dir)
+    siem("target_retention_delete", JOB_NAME, path=bkset_dir,
+         result="OK" if result == "SUCCESS" else "ERROR")
+    return result
+
+
 def latest_mtime(image_dir: Path) -> Optional[datetime]:
     """Ritorna il datetime dell'ultimo file di backup nell'image_dir, o None."""
     latest = None
@@ -205,6 +233,8 @@ def cleanup_vmdef(vm_dir: Path) -> list:
             except Exception as e:
                 print(f"    ERROR: {e}")
                 result = "FAIL"
+            siem("target_retention_delete", JOB_NAME, path=vmdef_indir,
+                 result="OK" if result == "SUCCESS" else "ERROR")
             cleaned.append((str(vmdef_indir), result))
 
     return cleaned
@@ -247,7 +277,7 @@ def apply_retention(retention: int) -> list:
             for bkset in bksets:
                 if int(bkset.name) <= to_purge_up_to:
                     print(f"    DELETING {bkset}")
-                    result = purge_backupset(bkset)
+                    result = purge_and_log(bkset)
                     purged.append((str(bkset), result))
 
         purged.extend(cleanup_vmdef(vm_dir))
@@ -258,7 +288,9 @@ def apply_retention(retention: int) -> list:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    global JOB_NAME
     cfg = load_config()
+    JOB_NAME = cfg["jobname"] or SCRIPT_DIR.name
     print(f"Config: {SCRIPT_DIR / 'config.ini'}")
     print(f"Retention: {cfg['retention']}  Job: {cfg['jobname']}")
     print(f"Email from: {cfg['email_from']}  To: {cfg['rcpt_to']}")
