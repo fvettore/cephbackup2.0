@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 import bkcrypt
-from bkexec import is_mounted, load_jobs
+from bkexec import job_reachable, load_jobs
 
 
 def latest_set_files(image_dir: Path) -> list:
@@ -47,8 +47,8 @@ def main():
         print(f"ERROR: job '{job_name}' non trovato in backupjobs.json")
         sys.exit(2)
 
-    if job.get("checkmount") and not is_mounted(job.get("mountpoint", "")):
-        print(f"ERROR: mountpoint {job.get('mountpoint')} non montato o non risponde")
+    if not job_reachable(job):
+        print(f"ERROR: target {job.get('path')} non montato o non risponde")
         sys.exit(2)
 
     job_dir = Path(job["path"]) / job_name

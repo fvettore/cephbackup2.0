@@ -17,6 +17,7 @@ from pathlib import Path
 
 import bkcrypt
 import bkstate
+from bkexec import job_reachable
 
 SCRIPT_DIR = Path(__file__).parent
 
@@ -104,7 +105,14 @@ def main():
         sys.exit(1)
 
     vm_name = sys.argv[1]
-    jobs    = load_jobs()
+    jobs    = []
+    for job in load_jobs():
+        # Un NAS che non risponde (NFS hard) bloccherebbe l'elenco: lo salta
+        if job_reachable(job, timeout=5):
+            jobs.append(job)
+        else:
+            print(f"WARNING: job {job['name']} saltato: {job.get('path')} non montato "
+                  f"o non risponde", file=sys.stderr)
     list_restore_points(vm_name, jobs)
 
 

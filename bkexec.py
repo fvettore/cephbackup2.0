@@ -103,6 +103,23 @@ def is_mounted(mountpoint: str, timeout: int = 15) -> bool:
     return True
 
 
+def job_reachable(job: dict, timeout: int = 15) -> bool:
+    """
+    True se la cartella del job si può leggere senza rischio di blocco:
+    mountpoint montato e reattivo (se checkmount) e `stat -f` sul path del job
+    entro timeout. Vale anche per job senza checkmount o disabilitati, il cui
+    path può stare su un NFS hard che non risponde più.
+    """
+    if job.get("checkmount") and not is_mounted(job.get("mountpoint", ""), timeout):
+        return False
+    try:
+        subprocess.run(["stat", "-f", str(job.get("path", ""))], capture_output=True,
+                       timeout=timeout, check=True)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError):
+        return False
+    return True
+
+
 def get_vm_images(vm_name, vm_config_path):
     """
     Legge l'XML libvirt e restituisce (lista_immagini, errore).

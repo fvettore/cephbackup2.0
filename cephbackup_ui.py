@@ -21,7 +21,30 @@ from pathlib import Path
 import bkcrypt
 import bksiem
 import bkstate
-from bkexec import is_mounted
+from bkexec import is_mounted, job_reachable
+
+# Esito del controllo mount per job, per non ripetere il timeout a ogni schermata
+_REACH_CACHE = {}
+REACH_TTL    = 60          # secondi
+REACH_TIMEOUT = 5          # secondi per stat -f
+UNREACHABLE  = set()       # job saltati nell'ultimo controllo (per gli avvisi)
+
+
+def reachable_jobs(jobs: list) -> list:
+    """Solo i job il cui target risponde: un NFS hard appeso bloccherebbe la UI."""
+    now, out = time.monotonic(), []
+    UNREACHABLE.clear()
+    for job in jobs:
+        key = (job.get('name'), job.get('path'), job.get('mountpoint'))
+        hit = _REACH_CACHE.get(key)
+        if hit is None or now - hit[1] > REACH_TTL:
+            hit = (job_reachable(job, timeout=REACH_TIMEOUT), now)
+            _REACH_CACHE[key] = hit
+        if hit[0]:
+            out.append(job)
+        else:
+            UNREACHABLE.add(job.get('name'))
+    return out
 
 SCRIPT_DIR = Path(__file__).parent
 TMP_DIR    = SCRIPT_DIR / 'tmp'
@@ -122,7 +145,7 @@ def fetch_vms(jobs: list) -> list:
     """Unique VM names, obtained by scanning job directories."""
     seen = set()
     vms  = []
-    for job in jobs:
+    for job in reachable_jobs(jobs):
         job_dir = Path(job['path']) / job['name']
         if not job_dir.is_dir():
             continue
@@ -136,7 +159,7 @@ def fetch_vms(jobs: list) -> list:
 def fetch_restore_points(jobs: list, vm_name: str) -> list:
     """Available restore points for a VM, obtained from the filesystem."""
     points = []
-    for job in jobs:
+    for job in reachable_jobs(jobs):
         job_name = job['name']
         job_path = job['path']
         vm_dir   = Path(job_path) / job_name / vm_name
@@ -1030,6 +1053,11 @@ def screen_vm_list(stdscr, config, jobs):
     stdscr.refresh()
 
     vms = fetch_vms(jobs)
+    if UNREACHABLE:
+        show_message(stdscr, "Restore",
+                     ["Jobs skipped, target not mounted or not responding:",
+                      "  " + ", ".join(sorted(UNREACHABLE)),
+                      "Their restore points are not listed."], C_ERR)
     if not vms:
         show_message(stdscr, "Restore", ["No VMs found in job directories."])
         return
@@ -1448,6 +1476,8 @@ def screen_add_vm(stdscr, config: dict, job: dict):
 
 
 def screen_vm_list_for_job(stdscr, config: dict, job: dict):
+    if not _job_dir_reachable(stdscr, job, title="VM management"):
+        return
     col_name = 24
     col_run  = 20
     col_stat =  6
@@ -1573,10 +1603,11 @@ def screen_vm_list_for_job(stdscr, config: dict, job: dict):
 
 # ── Schermata: gestione chiave di cifratura del job ──────────────────────────
 
-def _job_dir_reachable(stdscr, job) -> bool:
-    if job.get("checkmount") and not is_mounted(job.get("mountpoint", "")):
-        show_message(stdscr, "Encryption",
-                     [f"Mountpoint {job.get('mountpoint')} not mounted or not responding."], C_ERR)
+def _job_dir_reachable(stdscr, job, title="Encryption") -> bool:
+    if not job_reachable(job, timeout=REACH_TIMEOUT):
+        show_message(stdscr, title,
+                     [f"Target {job.get('path')} not mounted or not responding.",
+                      "(NFS server unreachable? Check the mount before retrying.)"], C_ERR)
         return False
     return True
 

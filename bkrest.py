@@ -32,6 +32,7 @@ from pathlib import Path
 
 import bkcrypt
 import bksiem
+from bkexec import job_reachable
 import bkstate
 
 SCRIPT_DIR = Path(__file__).parent
@@ -215,6 +216,10 @@ def main():
     job = find_job(jobs, job_name)
     if not job:
         lg(f"ERROR: job '{job_name}' non trovato in backupjobs.json")
+        sys.exit(1)
+
+    if not job_reachable(job):
+        lg(f"ERROR: target del job '{job_name}' ({job.get('path')}) non montato o non risponde")
         sys.exit(1)
 
     job_dir = Path(job["path"]) / job_name
